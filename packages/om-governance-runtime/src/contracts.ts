@@ -81,11 +81,13 @@ export type PurgeEvidence = {
   retentionPolicyId: string;
   policyHash: string;
   deploymentBindingFingerprint: string;
-  status: "succeeded" | "held" | "failed";
+  status: "succeeded" | "succeeded-with-quarantine" | "held" | "failed";
   startedAt: string;
   completedAt: string;
   deletedRecordCount: number;
   deletedRecordKeyHashes: string[];
+  quarantinedRecordCount: number;
+  quarantinedRecordKeyHashes: string[];
   legalHoldEvidenceRef: string | null;
   errorCode?: "RETENTION_RECORD_INVALID" | "PURGE_TRANSACTION_FAILED" |
     "RETENTION_CONTROL_INVALID";

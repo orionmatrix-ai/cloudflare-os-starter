@@ -63,6 +63,17 @@ class FaultingMemoryGovernanceStore extends MemoryGovernanceStore {
   }
 }
 
+class TrackingMemoryGovernanceStore extends MemoryGovernanceStore {
+  readonly listLimits: Array<number | undefined> = [];
+
+  override async list<T>(
+    options: { prefix?: string; limit?: number } = {},
+  ): Promise<Map<string, T>> {
+    this.listLimits.push(options.limit);
+    return super.list<T>(options);
+  }
+}
+
 function policy(overrides: Partial<GovernancePolicy> = {}): GovernancePolicy {
   return {
     policyId: "om-p3-google-sheets-v1",
@@ -257,18 +268,77 @@ describe("OM Governance Runtime", () => {
     expect(await store.get(`preparation:${preparation.preparationId}`)).toBeDefined();
   });
 
-  it("fails closed without partial deletion when a retention record is malformed", async () => {
-    const preparation = await engine.prepareObservation(intent(now));
-    store.values.set("gate:malformed", { evidenceId: "malformed" });
+  it("coalesces repeated legal-hold rechecks", async () => {
+    await engine.prepareObservation(intent(now));
+    const control = retentionControl(now, activePolicyHash, {
+      legalHoldActive: true,
+      legalHoldEvidenceRef: "legal-hold:case-2026-001",
+    });
+    await engine.purgeExpiredRecords(control);
+    now += 3_600_000;
+    await engine.purgeExpiredRecords({
+      ...control,
+      approvedAt: new Date(now - 1_000).toISOString(),
+      expiresAt: new Date(now + 86_400_000).toISOString(),
+    });
+    const holds = await store.list<Record<string, unknown>>({ prefix: "retention-legal-hold" });
+    expect(holds.size).toBe(1);
+    expect([...holds.values()][0]).toMatchObject({ status: "held", recheckCount: 2 });
+  });
+
+  it("quarantines a malformed indexed record without blocking other expired records", async () => {
+    const { preparation } = await permitted();
+    store.values.set("gate:cf-approval:request-1", { evidenceId: "malformed" });
     now += 86_400_001;
     const result = await engine.purgeExpiredRecords(retentionControl(now, activePolicyHash));
     expect(result.evidence).toMatchObject({
-      status: "failed",
-      deletedRecordCount: 0,
-      errorCode: "RETENTION_RECORD_INVALID",
+      status: "succeeded-with-quarantine",
+      quarantinedRecordCount: 1,
     });
-    expect(await store.get(`preparation:${preparation.preparationId}`)).toBeDefined();
-    expect(await store.get(`request:${preparation.requestId}`)).toBeDefined();
+    expect(await store.get(`preparation:${preparation.preparationId}`)).toBeUndefined();
+    expect(await store.get(`request:${preparation.requestId}`)).toBeUndefined();
+    expect(await store.get("gate:cf-approval:request-1")).toBeUndefined();
+    expect((await store.list({ prefix: "retention-quarantine:" })).size).toBe(1);
+  });
+
+  it("bounds each retention index scan to the approved batch plus lookahead", async () => {
+    const trackingStore = new TrackingMemoryGovernanceStore();
+    const activePolicy = policy();
+    activePolicy.policyHash = await fingerprint(policyFingerprintMaterial(activePolicy));
+    ACTIVE_BINDING_FINGERPRINT = await deploymentBindingFingerprint(activePolicy);
+    const isolated = new GovernanceEngine(trackingStore, activePolicy, () => now, () => `scan-${++sequence}`);
+    await isolated.prepareObservation(intent(now));
+    now += 86_400_001;
+    const result = await isolated.purgeExpiredRecords(retentionControl(now, activePolicy.policyHash, {
+      purgeBatchLimit: 1,
+    }));
+    expect(trackingStore.listLimits).toContain(2);
+    expect(result.evidence.deletedRecordCount).toBeLessThanOrEqual(1);
+    expect(Date.parse(result.nextAlarmAt)).toBe(now + 1_000);
+  });
+
+  it("sleeps until the earliest future expiry even when lookahead finds more indexes", async () => {
+    const preparation = await engine.prepareObservation(intent(now));
+    const result = await engine.purgeExpiredRecords(retentionControl(now, activePolicyHash, {
+      purgeBatchLimit: 1,
+    }));
+    expect(result.evidence.deletedRecordCount).toBe(0);
+    expect(result.nextAlarmAt).toBe(preparation.retentionExpiresAt);
+  });
+
+  it("coalesces repeated invalid retention-control Evidence", async () => {
+    await engine.recordRetentionControlFailure();
+    now += 60_000;
+    await engine.recordRetentionControlFailure();
+    const failures = await store.list<Record<string, unknown>>({
+      prefix: "retention-control-failure",
+    });
+    expect(failures.size).toBe(1);
+    expect([...failures.values()][0]).toMatchObject({
+      status: "failed",
+      errorCode: "RETENTION_CONTROL_INVALID",
+      failureCount: 2,
+    });
   });
 
   it("rolls back every deletion when purge storage fails and records failure Evidence", async () => {
@@ -288,6 +358,29 @@ describe("OM Governance Runtime", () => {
     });
     expect(await faultingStore.get(`preparation:${preparation.preparationId}`)).toBeDefined();
     expect(await faultingStore.get(`request:${preparation.requestId}`)).toBeDefined();
+  });
+
+  it("coalesces repeated purge transaction failures", async () => {
+    const faultingStore = new FaultingMemoryGovernanceStore();
+    const activePolicy = policy();
+    activePolicy.policyHash = await fingerprint(policyFingerprintMaterial(activePolicy));
+    ACTIVE_BINDING_FINGERPRINT = await deploymentBindingFingerprint(activePolicy);
+    const isolated = new GovernanceEngine(faultingStore, activePolicy, () => now, () => `failure-${++sequence}`);
+    await isolated.prepareObservation(intent(now));
+    now += 86_400_001;
+    faultingStore.failDeleteOnPrefix = "preparation:";
+    await isolated.purgeExpiredRecords(retentionControl(now, activePolicy.policyHash));
+    now += 60_000;
+    await isolated.purgeExpiredRecords(retentionControl(now, activePolicy.policyHash));
+    const failures = await faultingStore.list<Record<string, unknown>>({
+      prefix: "retention-purge-failure",
+    });
+    expect(failures.size).toBe(1);
+    expect([...failures.values()][0]).toMatchObject({
+      status: "failed",
+      errorCode: "PURGE_TRANSACTION_FAILED",
+      failureCount: 2,
+    });
   });
 
   it("keeps the Runtime contract generic while the first adapter remains Google Sheets", () => {

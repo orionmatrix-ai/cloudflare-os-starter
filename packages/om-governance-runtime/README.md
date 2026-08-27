@@ -51,12 +51,16 @@ Cloudflare `ApprovalQueue` currently returns no opaque signed approval record. T
 binding therefore stamps a trusted connector attestation after the queue call returns. This is a
 runtime trust boundary, not proof of an OM-Knowledge Canonical Human Gate record.
 
-Preparation, request replay, gate replay, permit, and purge-evidence records carry
-`retentionExpiresAt`. A Durable Object alarm evaluates the secret-bound
+Preparation, request replay, gate replay, permit, purge-evidence, and quarantine records carry
+`retentionExpiresAt` and a deadline-ordered retention index. A Durable Object alarm evaluates the secret-bound
 `OM_GOVERNANCE_RETENTION_CONTROL` manifest before deletion. It verifies the approved retention
 policy, policy and deployment fingerprints, account, Worker, stage, validity, revocation, legal
-hold, and bounded batch size. The manifest's retention approval ID must exactly match the
-deployment-configured Human Gate reference. Active legal hold deletes nothing and records held Evidence. Eligible
-expired records are deleted in one storage transaction with key hashes and success/failure
-Evidence; the governance state record is never a purge target. Deployment does not create or fill
+hold, and bounded batch size. Each alarm reads at most the approved batch plus one lookahead index
+entry; the deletion limit therefore also bounds the scan. The manifest's retention approval ID must
+exactly match the deployment-configured Human Gate reference. Active legal hold deletes nothing and
+coalesces repeated rechecks into one held Evidence state. Eligible expired records are deleted in one
+storage transaction with key hashes and success/failure Evidence. Malformed indexed records are moved
+out of active prefixes into a bounded-retention quarantine without blocking other eligible deletions.
+Repeated control and transaction failures are coalesced instead of creating unbounded failure records.
+The governance state record is never a purge target. Deployment does not create or fill
 the secret, so retention enablement remains a separate Human Gate.

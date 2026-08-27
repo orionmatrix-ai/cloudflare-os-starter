@@ -62,7 +62,9 @@ export class MemoryGovernanceStore implements GovernanceStore {
     return this.values.delete(key);
   }
 
-  async list<T>(options: { prefix?: string; limit?: number } = {}): Promise<Map<string, T>> {
+  async list<T>(
+    options: { prefix?: string; limit?: number } = {},
+  ): Promise<Map<string, T>> {
     const result = new Map<string, T>();
     for (const key of [...this.values.keys()].toSorted()) {
       if (options.prefix && !key.startsWith(options.prefix)) continue;
@@ -87,7 +89,39 @@ export class MemoryGovernanceStore implements GovernanceStore {
 const STATE_KEY = "governance-state";
 const RETENTION_PREFIXES = [
   "preparation:", "permit:", "request:", "gate:", "purge-evidence:",
+  "retention-quarantine:",
 ] as const;
+const RETENTION_INDEX_PREFIX = "retention-index:";
+const RETENTION_CONTROL_FAILURE_KEY = "retention-control-failure";
+const RETENTION_PURGE_FAILURE_KEY = "retention-purge-failure";
+const RETENTION_LEGAL_HOLD_KEY = "retention-legal-hold";
+
+type RetentionIndexEntry = {
+  schemaVersion: "1.0";
+  recordKey: string;
+  recordKeyHash: string;
+  retentionExpiresAt: string;
+};
+
+type RetentionQuarantineRecord = {
+  schemaVersion: "1.0";
+  sourceRecordKey: string;
+  sourceRecordKeyHash: string;
+  reason: "RETENTION_RECORD_INVALID" | "RETENTION_INDEX_INVALID";
+  quarantinedAt: string;
+  payload: unknown;
+  retentionExpiresAt: string;
+};
+
+type RetentionControlFailureRecord = PurgeEvidence & {
+  firstObservedAt: string;
+  failureCount: number;
+};
+
+type RetentionLegalHoldRecord = PurgeEvidence & {
+  firstObservedAt: string;
+  recheckCount: number;
+};
 
 function purgeEvidenceKey(id: string): string {
   return `purge-evidence:${id}`;
@@ -189,6 +223,44 @@ export async function fingerprint(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(stable(value));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function retentionIndexTimestamp(value: number): string {
+  assert(Number.isSafeInteger(value) && value >= 0, "retention index timestamp is invalid.");
+  return value.toString().padStart(15, "0");
+}
+
+async function retentionIndexKey(recordKey: string, retentionExpiresAt: string): Promise<string> {
+  const expiresAt = timestamp(retentionExpiresAt, `retention record ${recordKey}`);
+  const keyHash = await fingerprint(recordKey);
+  return `${RETENTION_INDEX_PREFIX}${retentionIndexTimestamp(expiresAt)}:${keyHash.slice(7)}`;
+}
+
+async function putRetainedRecord<T>(
+  store: GovernanceTransactionStore,
+  key: string,
+  value: T,
+): Promise<void> {
+  assert(RETENTION_PREFIXES.some((prefix) => key.startsWith(prefix)),
+    `retention record key is outside the managed prefixes: ${key}`);
+  assert(isObject(value), `retention record invalid: ${key}`);
+  const retentionExpiresAt = value.retentionExpiresAt;
+  nonempty(retentionExpiresAt, `retention record ${key}.retentionExpiresAt`);
+  timestamp(retentionExpiresAt, `retention record ${key}`);
+  const existing = await store.get<unknown>(key);
+  if (isObject(existing) && typeof existing.retentionExpiresAt === "string" &&
+    Number.isFinite(Date.parse(existing.retentionExpiresAt))) {
+    await store.delete(await retentionIndexKey(key, existing.retentionExpiresAt));
+  }
+  const recordKeyHash = await fingerprint(key);
+  const index: RetentionIndexEntry = {
+    schemaVersion: "1.0",
+    recordKey: key,
+    recordKeyHash,
+    retentionExpiresAt,
+  };
+  await store.put(key, value);
+  await store.put(await retentionIndexKey(key, retentionExpiresAt), index);
 }
 
 export function policyFingerprintMaterial(policy: GovernancePolicy): GovernancePolicyFingerprintMaterial {
@@ -554,8 +626,8 @@ export class GovernanceEngine {
       assert(!(await transaction.get(requestKey(intent.requestId))), "requestId was already used.");
       const current = await transaction.get<StateSnapshot>(STATE_KEY);
       assert(current?.contentHash === state.contentHash, "governance state drift detected.");
-      await transaction.put(preparationKey(preparationId), preparation);
-      await transaction.put(requestKey(intent.requestId), {
+      await putRetainedRecord(transaction, preparationKey(preparationId), preparation);
+      await putRetainedRecord(transaction, requestKey(intent.requestId), {
         preparationId,
         createdAt: intent.requestedAt,
         retentionExpiresAt: preparation.retentionExpiresAt,
@@ -620,13 +692,13 @@ export class GovernanceEngine {
         consumed: false,
         outcomeRecorded: false,
       };
-      await transaction.put(preparationKey(preparation.preparationId), preparation);
-      await transaction.put(gateKey(gate.evidenceId), {
+      await putRetainedRecord(transaction, preparationKey(preparation.preparationId), preparation);
+      await putRetainedRecord(transaction, gateKey(gate.evidenceId), {
         preparationId: preparation.preparationId,
         claimedAt: new Date(now).toISOString(),
         retentionExpiresAt: preparation.retentionExpiresAt,
       });
-      await transaction.put(permitKey(permitId), permit);
+      await putRetainedRecord(transaction, permitKey(permitId), permit);
       const { operation: _operation,
         deploymentBindingFingerprint: _deploymentBindingFingerprint,
         consumed: _consumed, outcomeRecorded: _outcomeRecorded, ...publicPermit } = permit;
@@ -659,7 +731,7 @@ export class GovernanceEngine {
         transactionalState.contentHash === permit.stateHash,
       "governance state drift detected before execution.");
       permit.consumed = true;
-      await transaction.put(permitKey(permit.permitId), permit);
+      await putRetainedRecord(transaction, permitKey(permit.permitId), permit);
       return { allowed: true as const, permitId: permit.permitId };
     });
   }
@@ -720,7 +792,7 @@ export class GovernanceEngine {
         bindingFingerprint,
       );
       permit.outcomeRecorded = true;
-      await transaction.put(permitKey(permit.permitId), permit);
+      await putRetainedRecord(transaction, permitKey(permit.permitId), permit);
       await transaction.put(STATE_KEY, next);
       return next;
     });
@@ -740,7 +812,8 @@ export class GovernanceEngine {
     ).toISOString();
 
     if (control.legalHoldActive) {
-      const evidence: PurgeEvidence = {
+      const existing = await this.store.get<RetentionLegalHoldRecord>(RETENTION_LEGAL_HOLD_KEY);
+      const evidence: RetentionLegalHoldRecord = {
         schemaVersion: "1.0",
         purgeRunId,
         retentionApprovalId: control.retentionApprovalId,
@@ -752,11 +825,16 @@ export class GovernanceEngine {
         completedAt: new Date(this.now()).toISOString(),
         deletedRecordCount: 0,
         deletedRecordKeyHashes: [],
+        quarantinedRecordCount: 0,
+        quarantinedRecordKeyHashes: [],
         legalHoldEvidenceRef: control.legalHoldEvidenceRef,
         retentionExpiresAt: evidenceExpiry,
+        firstObservedAt: existing?.firstObservedAt ?? startedAt,
+        recheckCount: (existing?.recheckCount ?? 0) + 1,
       };
       await this.store.transaction(async (transaction) => {
-        await transaction.put(purgeEvidenceKey(purgeRunId), evidence);
+        await transaction.put(RETENTION_LEGAL_HOLD_KEY, evidence);
+        await transaction.delete(RETENTION_CONTROL_FAILURE_KEY);
       });
       return {
         evidence,
@@ -766,29 +844,96 @@ export class GovernanceEngine {
 
     try {
       return await this.store.transaction(async (transaction) => {
-        const records = new Map<string, unknown>();
-        for (const prefix of RETENTION_PREFIXES) {
-          for (const [key, value] of await transaction.list<unknown>({ prefix })) {
-            records.set(key, value);
-          }
-        }
-        const expired: string[] = [];
+        const page = await transaction.list<unknown>({
+          prefix: RETENTION_INDEX_PREFIX,
+          limit: control.purgeBatchLimit + 1,
+        });
+        const entries = [...page].slice(0, control.purgeBatchLimit);
+        const deletedRecordKeyHashes: string[] = [];
+        const quarantinedRecordKeyHashes: string[] = [];
         let nextExpiry = Number.POSITIVE_INFINITY;
-        for (const [key, value] of records) {
-          assert(isObject(value), `retention record invalid: ${key}`);
+        let reachedFutureIndex = false;
+        for (const [indexKey, rawIndex] of entries) {
+          let index: RetentionIndexEntry;
           let expiry: number;
           try {
-            expiry = timestamp(value.retentionExpiresAt, `retention record ${key}`);
+            assert(isObject(rawIndex), `retention record invalid: ${indexKey}`);
+            exactKeys(rawIndex,
+              ["schemaVersion", "recordKey", "recordKeyHash", "retentionExpiresAt"],
+              `retention index ${indexKey}`);
+            assert(rawIndex.schemaVersion === "1.0", `retention record invalid: ${indexKey}`);
+            const recordKey = rawIndex.recordKey;
+            const recordKeyHash = rawIndex.recordKeyHash;
+            const retentionExpiresAt = rawIndex.retentionExpiresAt;
+            nonempty(recordKey, `retention index ${indexKey}.recordKey`);
+            nonempty(recordKeyHash, `retention index ${indexKey}.recordKeyHash`);
+            nonempty(retentionExpiresAt, `retention index ${indexKey}.retentionExpiresAt`);
+            assert(RETENTION_PREFIXES.some((prefix) => recordKey.startsWith(prefix)),
+              `retention record invalid: ${indexKey}`);
+            expiry = timestamp(retentionExpiresAt,
+              `retention index ${indexKey}.retentionExpiresAt`);
+            assert(recordKeyHash === await fingerprint(recordKey),
+              `retention record invalid: ${indexKey}`);
+            assert(indexKey === await retentionIndexKey(recordKey, retentionExpiresAt),
+              `retention record invalid: ${indexKey}`);
+            index = { schemaVersion: "1.0", recordKey, recordKeyHash, retentionExpiresAt };
           } catch {
-            throw new Error(`retention record invalid: ${key}`);
+            const sourceRecordKeyHash = await fingerprint(indexKey);
+            const quarantine: RetentionQuarantineRecord = {
+              schemaVersion: "1.0",
+              sourceRecordKey: indexKey,
+              sourceRecordKeyHash,
+              reason: "RETENTION_INDEX_INVALID",
+              quarantinedAt: new Date(now).toISOString(),
+              payload: rawIndex,
+              retentionExpiresAt: evidenceExpiry,
+            };
+            await transaction.delete(indexKey);
+            await putRetainedRecord(transaction,
+              `retention-quarantine:${sourceRecordKeyHash.slice(7)}`, quarantine);
+            quarantinedRecordKeyHashes.push(sourceRecordKeyHash);
+            continue;
           }
-          if (expiry <= now) expired.push(key);
-          else nextExpiry = Math.min(nextExpiry, expiry);
+          if (expiry > now) {
+            nextExpiry = expiry;
+            reachedFutureIndex = true;
+            break;
+          }
+          const record = await transaction.get<unknown>(index.recordKey);
+          if (record === undefined) {
+            await transaction.delete(indexKey);
+            continue;
+          }
+          if (!isObject(record) || typeof record.retentionExpiresAt !== "string" ||
+            !Number.isFinite(Date.parse(record.retentionExpiresAt))) {
+            const quarantine: RetentionQuarantineRecord = {
+              schemaVersion: "1.0",
+              sourceRecordKey: index.recordKey,
+              sourceRecordKeyHash: index.recordKeyHash,
+              reason: "RETENTION_RECORD_INVALID",
+              quarantinedAt: new Date(now).toISOString(),
+              payload: record,
+              retentionExpiresAt: evidenceExpiry,
+            };
+            await transaction.delete(index.recordKey);
+            await transaction.delete(indexKey);
+            await putRetainedRecord(transaction,
+              `retention-quarantine:${index.recordKeyHash.slice(7)}`, quarantine);
+            quarantinedRecordKeyHashes.push(index.recordKeyHash);
+            continue;
+          }
+          const currentIndexKey = await retentionIndexKey(index.recordKey, record.retentionExpiresAt);
+          if (currentIndexKey !== indexKey) {
+            await transaction.delete(indexKey);
+            await putRetainedRecord(transaction, index.recordKey, record);
+            nextExpiry = Math.min(nextExpiry, Date.parse(record.retentionExpiresAt));
+            continue;
+          }
+          await transaction.delete(index.recordKey);
+          await transaction.delete(indexKey);
+          deletedRecordKeyHashes.push(index.recordKeyHash);
         }
-        expired.sort();
-        const targets = expired.slice(0, control.purgeBatchLimit);
-        const deletedRecordKeyHashes = await Promise.all(targets.map((key) => fingerprint(key)));
-        for (const key of targets) await transaction.delete(key);
+        const hasMoreIndexEntries = page.size > entries.length && !reachedFutureIndex;
         const evidence: PurgeEvidence = {
           schemaVersion: "1.0",
           purgeRunId,
@@ -796,17 +941,23 @@ export class GovernanceEngine {
           retentionPolicyId: control.retentionPolicyId,
           policyHash: this.policy.policyHash,
           deploymentBindingFingerprint: bindingFingerprint,
-          status: "succeeded",
+          status: quarantinedRecordKeyHashes.length > 0
+            ? "succeeded-with-quarantine"
+            : "succeeded",
           startedAt,
           completedAt: new Date(this.now()).toISOString(),
-          deletedRecordCount: targets.length,
+          deletedRecordCount: deletedRecordKeyHashes.length,
           deletedRecordKeyHashes,
+          quarantinedRecordCount: quarantinedRecordKeyHashes.length,
+          quarantinedRecordKeyHashes,
           legalHoldEvidenceRef: null,
           retentionExpiresAt: evidenceExpiry,
         };
-        await transaction.put(purgeEvidenceKey(purgeRunId), evidence);
-        const moreExpired = expired.length > targets.length;
-        const nextAlarm = moreExpired
+        await putRetainedRecord(transaction, purgeEvidenceKey(purgeRunId), evidence);
+        await transaction.delete(RETENTION_CONTROL_FAILURE_KEY);
+        await transaction.delete(RETENTION_PURGE_FAILURE_KEY);
+        await transaction.delete(RETENTION_LEGAL_HOLD_KEY);
+        const nextAlarm = hasMoreIndexEntries || nextExpiry <= now
           ? now + 1_000
           : Number.isFinite(nextExpiry)
             ? nextExpiry
@@ -817,7 +968,10 @@ export class GovernanceEngine {
       const errorCode = error instanceof Error && error.message.startsWith("retention record invalid:")
         ? "RETENTION_RECORD_INVALID" as const
         : "PURGE_TRANSACTION_FAILED" as const;
-      const evidence: PurgeEvidence = {
+      const existing = await this.store.get<RetentionControlFailureRecord>(
+        RETENTION_PURGE_FAILURE_KEY,
+      );
+      const evidence: RetentionControlFailureRecord = {
         schemaVersion: "1.0",
         purgeRunId,
         retentionApprovalId: control.retentionApprovalId,
@@ -829,11 +983,15 @@ export class GovernanceEngine {
         completedAt: new Date(this.now()).toISOString(),
         deletedRecordCount: 0,
         deletedRecordKeyHashes: [],
+        quarantinedRecordCount: 0,
+        quarantinedRecordKeyHashes: [],
         legalHoldEvidenceRef: null,
         errorCode,
         retentionExpiresAt: evidenceExpiry,
+        firstObservedAt: existing?.firstObservedAt ?? startedAt,
+        failureCount: (existing?.failureCount ?? 0) + 1,
       };
-      await this.store.put(purgeEvidenceKey(purgeRunId), evidence);
+      await this.store.put(RETENTION_PURGE_FAILURE_KEY, evidence);
       return { evidence, nextAlarmAt: new Date(now + 60_000).toISOString() };
     }
   }
@@ -843,7 +1001,10 @@ export class GovernanceEngine {
     const now = this.now();
     const bindingFingerprint = await this.currentDeploymentBindingFingerprint();
     const purgeRunId = `PGR-CONTROL-${now}-${this.id()}`;
-    const evidence: PurgeEvidence = {
+    const existing = await this.store.get<RetentionControlFailureRecord>(
+      RETENTION_CONTROL_FAILURE_KEY,
+    );
+    const evidence: RetentionControlFailureRecord = {
       schemaVersion: "1.0",
       purgeRunId,
       retentionApprovalId: "unverified-retention-control",
@@ -855,13 +1016,17 @@ export class GovernanceEngine {
       completedAt: new Date(this.now()).toISOString(),
       deletedRecordCount: 0,
       deletedRecordKeyHashes: [],
+      quarantinedRecordCount: 0,
+      quarantinedRecordKeyHashes: [],
       legalHoldEvidenceRef: null,
       errorCode: "RETENTION_CONTROL_INVALID",
       retentionExpiresAt: new Date(
         now + this.policy.recordRetentionSeconds * 1_000,
       ).toISOString(),
+      firstObservedAt: existing?.firstObservedAt ?? new Date(now).toISOString(),
+      failureCount: (existing?.failureCount ?? 0) + 1,
     };
-    await this.store.put(purgeEvidenceKey(purgeRunId), evidence);
+    await this.store.put(RETENTION_CONTROL_FAILURE_KEY, evidence);
     return { evidence, nextAlarmAt: new Date(now + 60_000).toISOString() };
   }
 }
