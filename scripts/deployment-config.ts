@@ -20,6 +20,45 @@ export type AiGatewayProvider = "anthropic" | "openai" | "google" | "cloudflare"
 export const AI_GATEWAY_PROVIDERS: readonly AiGatewayProvider[] =
   ["anthropic", "openai", "google", "cloudflare"];
 
+export interface GovernanceStateVector {
+  E: number;
+  K: number;
+  U: number;
+  R: number;
+  C: number;
+  D: number;
+  L: number;
+  A: number;
+  X: number;
+}
+
+export type GovernanceRuntimeConfig = {
+  enabled: false;
+  policy?: never;
+} | {
+  enabled: true;
+  deploymentStage: "p3-evaluation";
+  approvalReference: string;
+  retentionApprovalReference: string;
+  runtimeEnablementApproved: true;
+  policy: {
+    policyId: string;
+    principalId: string;
+    capabilityId: string;
+    authorityId: string;
+    permissionId: string;
+    operation: "google.sheets.range.read";
+    service: "google-sheets";
+    dataClass: "synthetic";
+    preparationTtlSeconds: number;
+    permitTtlSeconds: number;
+    recordRetentionSeconds: number;
+    mandatoryHumanGate: true;
+    initialState: GovernanceStateVector;
+    initialMeasurementConfidence: GovernanceStateVector;
+  };
+};
+
 /**
  * The public address of the router Worker. Exactly one field is set; `validateConfig` enforces
  * that, since wrangler would otherwise happily deploy both a custom domain and a workers.dev route.
@@ -114,6 +153,8 @@ export interface DeploymentConfig {
     customGatekeeper: { name: string };
     /** Required only when `googleSheetsGuard.enabled`. */
     googleSheetsGuard?: { name: string };
+    /** Required when the guarded connector is enabled. Private service-binding target only. */
+    omGovernanceRuntime?: { name: string };
     /** Only required when `errorReporting.enabled`. */
     errorReporter?: { name: string };
   };
@@ -124,6 +165,8 @@ export interface DeploymentConfig {
   customGatekeeper: { name: string; message: string };
   /** P3 exact-resource Google Sheets facade. Secrets hold the resource ID and fixed range. */
   googleSheetsGuard?: { enabled: boolean };
+  /** Evidence-bound state, discrete gate, revalidation, permit, and outcome feedback runtime. */
+  governanceRuntime?: GovernanceRuntimeConfig;
   /** Private explicit-issue destination. */
   errorReporting: { enabled: boolean; environment?: string; release?: string | null };
   /** Workshop KV/R2. `null` requests Wrangler automatic provisioning. */
@@ -188,6 +231,8 @@ export interface GeneratedConfigs {
   customGatekeeper: ProdWranglerConfig;
   /** Absent when `googleSheetsGuard.enabled` is false or omitted. */
   googleSheetsGuard?: ProdWranglerConfig;
+  /** Absent when `governanceRuntime.enabled` is false or omitted. */
+  omGovernanceRuntime?: ProdWranglerConfig;
   /** Absent when `errorReporting.enabled` is false. */
   errorReporter?: ProdWranglerConfig;
 }
@@ -200,6 +245,7 @@ export interface BaseConfigs {
   scheduler: ProdWranglerConfig;
   customGatekeeper: ProdWranglerConfig;
   googleSheetsGuard: ProdWranglerConfig;
+  omGovernanceRuntime: ProdWranglerConfig;
   errorReporter: ProdWranglerConfig;
 }
 

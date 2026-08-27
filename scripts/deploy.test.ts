@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { parse, type ParseError } from "jsonc-parser";
-import { aiGatewayPlan, buildCommands, generateConfigs, validateConfig } from "./deploy.ts";
+import {
+  aiGatewayPlan,
+  buildCommands,
+  generateConfigs,
+  governancePolicyHash,
+  validateConfig,
+} from "./deploy.ts";
 import type {
   BaseConfigs,
   DeploymentConfig,
@@ -20,6 +26,7 @@ const validConfig: DeploymentConfig = {
     scheduler: { name: "acme-cloudflare-os-scheduler" },
     customGatekeeper: { name: "acme-cloudflare-os-custom" },
     googleSheetsGuard: { name: "acme-cloudflare-os-google-sheets" },
+    omGovernanceRuntime: { name: "acme-cloudflare-os-governance" },
     errorReporter: { name: "acme-cloudflare-os-errors" },
   },
   access: {
@@ -40,6 +47,7 @@ const validConfig: DeploymentConfig = {
   },
   customGatekeeper: { name: "Acme", message: "Use the company handbook." },
   googleSheetsGuard: { enabled: false },
+  governanceRuntime: { enabled: false },
   errorReporting: { enabled: true, environment: "production", release: "abc123" },
   resources: {
     blueprintsKvNamespaceId: "blueprints-kv-id",
@@ -77,6 +85,7 @@ async function baseConfigs(): Promise<BaseConfigs> {
     scheduler: await baseConfig("../cloudflare-os/packages/gatekeeper-scheduler/wrangler.jsonc"),
     customGatekeeper: await baseConfig("../packages/custom-gatekeeper/wrangler.jsonc"),
     googleSheetsGuard: await baseConfig("../packages/google-sheets-guard/wrangler.jsonc"),
+    omGovernanceRuntime: await baseConfig("../packages/om-governance-runtime/wrangler.jsonc"),
     errorReporter: await baseConfig("../packages/error-reporter/wrangler.jsonc"),
   };
 }
@@ -323,6 +332,7 @@ test("deploys the ambient Scheduler Gatekeeper the hosted flow preinstalls", asy
 test("keeps the P3 Google Sheets guard absent by default", async () => {
   const generated = generateConfigs(validConfig, await baseConfigs());
   assert.equal(generated.googleSheetsGuard, undefined);
+  assert.equal(generated.omGovernanceRuntime, undefined);
   assert.equal(generated.router.services!.some(
     (service) => service.binding === "GATEKEEPER_GOOGLE_SHEETS_GUARD"), false);
   assert.equal(generated.workshop.services!.some(
@@ -332,15 +342,54 @@ test("keeps the P3 Google Sheets guard absent by default", async () => {
 });
 
 test("generates a private, secret-bound P3 Google Sheets guard when enabled", async () => {
-  const config = variant((c) => { c.googleSheetsGuard = { enabled: true }; });
+  const config = variant((c) => {
+    c.googleSheetsGuard = { enabled: true };
+    c.governanceRuntime = {
+      enabled: true,
+      deploymentStage: "p3-evaluation",
+      approvalReference: "human-gate:p3-runtime-evaluation",
+      retentionApprovalReference: "human-gate:p3-retention-purge",
+      runtimeEnablementApproved: true,
+      policy: {
+        policyId: "om-p3-google-sheets-v1",
+        principalId: "principal:om-inc:p3-evaluator",
+        capabilityId: "capability:google-sheets:range-read",
+        authorityId: "authority:om-inc:p3-synthetic-read",
+        permissionId: "permission:om-inc:p3-fixed-range",
+        operation: "google.sheets.range.read",
+        service: "google-sheets",
+        dataClass: "synthetic",
+        preparationTtlSeconds: 120,
+        permitTtlSeconds: 30,
+        recordRetentionSeconds: 86_400,
+        mandatoryHumanGate: true,
+        initialState: { E: .8, K: .8, U: .2, R: .2, C: .1, D: .1, L: .2, A: .1, X: .2 },
+        initialMeasurementConfidence: {
+          E: .8, K: .8, U: .8, R: .8, C: .8, D: .8, L: .8, A: .8, X: .8,
+        },
+      },
+    };
+  });
   const generated = generateConfigs(config, await baseConfigs());
   const guard = generated.googleSheetsGuard!;
+  const governance = generated.omGovernanceRuntime!;
+  if (!config.governanceRuntime?.enabled) throw new Error("test fixture must enable Governance Runtime");
+  const expectedPolicyHash = governancePolicyHash({
+    ...config.governanceRuntime!.policy!,
+    deploymentApprovalReference: config.governanceRuntime!.approvalReference,
+    trustedCallerId: "google-sheets-guard",
+  });
 
   assert.equal(guard.name, "acme-cloudflare-os-google-sheets");
   assert.equal(guard.workers_dev, false);
   assert.equal(guard.preview_urls, false);
   assert.deepEqual(guard.vars, {
     BASE_URL: "https://os.example.com/gatekeeper/google-sheets-guard",
+    OM_GOVERNANCE_POLICY_HASH: expectedPolicyHash,
+    OM_GOVERNANCE_PRINCIPAL_ID: "principal:om-inc:p3-evaluator",
+    OM_GOVERNANCE_CAPABILITY_ID: "capability:google-sheets:range-read",
+    OM_GOVERNANCE_AUTHORITY_ID: "authority:om-inc:p3-synthetic-read",
+    OM_GOVERNANCE_PERMISSION_ID: "permission:om-inc:p3-fixed-range",
   });
   assert.deepEqual(guard.secrets, { required: [
     "CLIENT_ID",
@@ -356,8 +405,33 @@ test("generates a private, secret-bound P3 Google Sheets guard when enabled", as
     service.binding === "GATEKEEPER_GOOGLE_SHEETS_GUARD" &&
     service.service === "acme-cloudflare-os-google-sheets" &&
     service.entrypoint === "GatekeeperVendor"));
+  assert.ok(guard.services!.some((service) =>
+    service.binding === "OM_GOVERNANCE" &&
+    service.service === "acme-cloudflare-os-governance" &&
+    service.entrypoint === "GovernanceRuntimeService" &&
+    service.props?.callerId === "google-sheets-guard"));
+  assert.equal(governance.name, "acme-cloudflare-os-governance");
+  assert.equal(governance.workers_dev, false);
+  assert.equal(governance.preview_urls, false);
+  assert.deepEqual(governance.secrets, { required: [
+    "P3_SPREADSHEET_ID",
+    "P3_ALLOWED_RANGE",
+    "OM_GOVERNANCE_DEPLOYMENT_APPROVAL",
+    "OM_GOVERNANCE_RETENTION_CONTROL",
+  ] });
+  assert.equal(governance.vars!.OM_GOVERNANCE_ACCOUNT_ID, config.accountId);
+  assert.equal(governance.vars!.OM_GOVERNANCE_RUNTIME_WORKER, "acme-cloudflare-os-governance");
+  assert.equal(governance.vars!.OM_GOVERNANCE_ADAPTER_WORKER, "acme-cloudflare-os-google-sheets");
+  assert.equal(governance.vars!.OM_GOVERNANCE_STAGE, "p3-evaluation");
+  assert.equal(
+    governance.vars!.OM_GOVERNANCE_RETENTION_APPROVAL_ID,
+    "human-gate:p3-retention-purge",
+  );
+  assert.equal(typeof governance.vars!.OM_GOVERNANCE_POLICY, "string");
   assert.ok(buildCommands(config).some(
     ({ args }) => args.includes("google-sheets-guard")));
+  assert.ok(buildCommands(config).some(
+    ({ args }) => args.includes("om-governance-runtime")));
   assert.ok(buildCommands(config).some(({ args }) =>
     args.includes("@gadgets/google-gatekeeper") && args.at(-1) === "build:configurator"));
 });
@@ -372,8 +446,77 @@ test("requires a P3 guard Worker name only when the guard is enabled", () => {
   const enabled = variant((c) => {
     delete c.workers.googleSheetsGuard;
     c.googleSheetsGuard = { enabled: true };
+    c.governanceRuntime = {
+      enabled: true,
+      deploymentStage: "p3-evaluation",
+      approvalReference: "human-gate:p3-runtime-evaluation",
+      retentionApprovalReference: "human-gate:p3-retention-purge",
+      runtimeEnablementApproved: true,
+      policy: {},
+    };
   });
-  assert.throws(() => validateConfig(enabled), /workers.googleSheetsGuard.name/);
+  assert.throws(() => validateConfig(enabled));
+});
+
+test("refuses to enable the P3 guard without the Governance Runtime", () => {
+  assert.throws(
+    () => validateConfig(variant((c) => { c.googleSheetsGuard = { enabled: true }; })),
+    /requires governanceRuntime.enabled/,
+  );
+});
+
+test("refuses to enable the P3-bound Governance Runtime without the Google adapter", () => {
+  assert.throws(
+    () => validateConfig(variant((c) => { c.governanceRuntime = { enabled: true }; })),
+    /requires googleSheetsGuard.enabled/,
+  );
+});
+
+test("rejects governance policies that shrink mandatory boundaries", () => {
+  const base = variant((c) => {
+    c.googleSheetsGuard = { enabled: true };
+    c.governanceRuntime = {
+      enabled: true,
+      deploymentStage: "p3-evaluation",
+      approvalReference: "human-gate:p3-runtime-evaluation",
+      retentionApprovalReference: "human-gate:p3-retention-purge",
+      runtimeEnablementApproved: true,
+      policy: {
+        policyId: "policy",
+        principalId: "principal", capabilityId: "capability", authorityId: "authority",
+        permissionId: "permission", operation: "google.sheets.range.read",
+        service: "google-sheets", dataClass: "synthetic", preparationTtlSeconds: 120,
+        permitTtlSeconds: 30, mandatoryHumanGate: true,
+        recordRetentionSeconds: 86_400,
+        initialState: { E: .8, K: .8, U: .2, R: .2, C: .1, D: .1, L: .2, A: .1, X: .2 },
+        initialMeasurementConfidence: {
+          E: .8, K: .8, U: .8, R: .8, C: .8, D: .8, L: .8, A: .8, X: .8,
+        },
+      },
+    };
+  });
+  assert.doesNotThrow(() => validateConfig(base));
+  assert.throws(() => validateConfig(variant((c) => {
+    Object.assign(c, structuredClone(base));
+    c.governanceRuntime.policy.mandatoryHumanGate = false;
+  })), /must remain true/);
+  assert.throws(() => validateConfig(variant((c) => {
+    Object.assign(c, structuredClone(base));
+    delete c.governanceRuntime.policy.initialState.X;
+    c.governanceRuntime.policy.initialState.R = 2;
+  })), /initialState/);
+  assert.throws(() => validateConfig(variant((c) => {
+    Object.assign(c, structuredClone(base));
+    c.governanceRuntime.approvalReference = "";
+  })), /approvalReference/);
+  assert.throws(() => validateConfig(variant((c) => {
+    Object.assign(c, structuredClone(base));
+    c.governanceRuntime.retentionApprovalReference = "";
+  })), /retentionApprovalReference/);
+  assert.throws(() => validateConfig(variant((c) => {
+    Object.assign(c, structuredClone(base));
+    c.governanceRuntime.runtimeEnablementApproved = false;
+  })), /runtimeEnablementApproved/);
 });
 
 test("requires an explicit boolean for the P3 guard enabled state", () => {

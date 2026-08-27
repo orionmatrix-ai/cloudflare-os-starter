@@ -1,4 +1,10 @@
 import type { SpreadsheetRange, SpreadsheetValueMode } from "./types.js";
+import type {
+  GovernanceRuntimeBinding,
+  ObservationIntentRequest,
+  ObservationOutcome,
+  ObservationScope,
+} from "om-governance-runtime";
 
 export const SHEETS_RESOURCE_PATTERN =
   "https://docs.google.com/spreadsheets/d/:spreadsheetId/*";
@@ -11,12 +17,23 @@ const MAX_APPROVED_CELLS = 1_000;
 export type GuardEnv = {
   P3_SPREADSHEET_ID?: string;
   P3_ALLOWED_RANGE?: string;
+  OM_GOVERNANCE_POLICY_HASH?: string;
+  OM_GOVERNANCE_PRINCIPAL_ID?: string;
+  OM_GOVERNANCE_CAPABILITY_ID?: string;
+  OM_GOVERNANCE_AUTHORITY_ID?: string;
+  OM_GOVERNANCE_PERMISSION_ID?: string;
+  OM_GOVERNANCE?: GovernanceRuntimeBinding;
 };
 
 export type GuardConfig = {
   spreadsheetId: string;
   allowedRange: string;
   approvedCells: number;
+  policyHash: string;
+  principalId: string;
+  capabilityId: string;
+  authorityId: string;
+  permissionId: string;
 };
 
 export type GuardConnectOptions = {
@@ -69,7 +86,34 @@ export function parseGuardConfig(env: GuardEnv): GuardConfig {
   if (!Number.isSafeInteger(approvedCells) || approvedCells > MAX_APPROVED_CELLS) {
     throw new Error(`P3_ALLOWED_RANGE may contain at most ${MAX_APPROVED_CELLS} cells.`);
   }
-  return { spreadsheetId, allowedRange, approvedCells };
+  const policyHash = env.OM_GOVERNANCE_POLICY_HASH;
+  if (!policyHash || !/^sha256:[0-9a-f]{64}$/.test(policyHash)) {
+    throw new Error("OM_GOVERNANCE_POLICY_HASH must bind the guard to one governance policy.");
+  }
+  const bindings = {
+    principalId: env.OM_GOVERNANCE_PRINCIPAL_ID,
+    capabilityId: env.OM_GOVERNANCE_CAPABILITY_ID,
+    authorityId: env.OM_GOVERNANCE_AUTHORITY_ID,
+    permissionId: env.OM_GOVERNANCE_PERMISSION_ID,
+  };
+  for (const [name, value] of Object.entries(bindings)) {
+    if (!value || value.trim().length === 0) {
+      throw new Error(`${name} must be bound by the deployment governance policy.`);
+    }
+  }
+  if (!env.OM_GOVERNANCE) {
+    throw new Error("OM_GOVERNANCE service binding is required; no fallback is permitted.");
+  }
+  return {
+    spreadsheetId,
+    allowedRange,
+    approvedCells,
+    policyHash,
+    principalId: bindings.principalId!,
+    capabilityId: bindings.capabilityId!,
+    authorityId: bindings.authorityId!,
+    permissionId: bindings.permissionId!,
+  };
 }
 
 export function parseApprovedSpreadsheetUrl(url: string, expectedId: string): string {
@@ -111,13 +155,85 @@ export async function readAfterAuthorization(
   approvalQueue: ObservationQueue,
   upstream: UpstreamReader,
   config: GuardConfig,
+  governance: GovernanceRuntimeBinding,
   options?: { valueMode?: SpreadsheetValueMode },
 ): Promise<SpreadsheetRange> {
+  const requestId = `google-sheets-read:${crypto.randomUUID()}`;
+  const scope: ObservationScope = {
+    service: "google-sheets",
+    resourceId: config.spreadsheetId,
+    resourceScope: config.allowedRange,
+    dataClass: "synthetic",
+  };
+  const intent: ObservationIntentRequest = {
+    schemaVersion: "1.0",
+    requestId,
+    principalId: config.principalId,
+    capabilityId: config.capabilityId,
+    authorityId: config.authorityId,
+    permissionId: config.permissionId,
+    operation: "google.sheets.range.read",
+    requestedAt: new Date().toISOString(),
+    scope,
+    evidenceRefs: [
+      `policy:${config.policyHash}`,
+      `guard:google-sheets:${config.spreadsheetId}:${config.allowedRange}`,
+    ],
+  };
+  const preparation = await governance.prepareObservation(intent);
   await approvalQueue.authorizeObservation({
     title: `Read approved Google Sheets range ${config.allowedRange}`,
     description:
       `Read ${config.approvedCells.toLocaleString()} cell(s) from the single ` +
-      "deployment-approved spreadsheet range.",
+      `deployment-approved spreadsheet range. Governance verification: ` +
+      `${preparation.envelope.verificationIntensity}; risk index ` +
+      `${preparation.envelope.riskIndex.toFixed(3)}.`,
   });
-  return upstream.readRange(config.allowedRange, options);
+  const permit = await governance.authorizeObservation({
+    preparationId: preparation.preparationId,
+    requestId,
+    gate: {
+      source: "cloudflare-approval-queue",
+      evidenceId: `cloudflare-approval:${requestId}:${preparation.preparationId}`,
+      approvedAt: new Date().toISOString(),
+    },
+  });
+  await governance.consumeObservationPermit({
+    permitId: permit.permitId,
+    requestId,
+    operation: "google.sheets.range.read",
+    scope,
+  });
+  let result: SpreadsheetRange;
+  try {
+    result = await upstream.readRange(config.allowedRange, options);
+  } catch (error) {
+    const outcome: ObservationOutcome = {
+      permitId: permit.permitId,
+      requestId,
+      status: "failed",
+      observedAt: new Date().toISOString(),
+      verificationStatus: "unverified",
+      evidenceRefs: [`observation:${requestId}:upstream-read-failed`],
+      errorCode: "UPSTREAM_READ_FAILED",
+    };
+    try {
+      await governance.recordObservationOutcome(outcome);
+    } catch (recordError) {
+      throw new Error("Read failed and outcome evidence could not be recorded.", {
+        cause: recordError,
+      });
+    }
+    throw error;
+  }
+  const outcome: ObservationOutcome = {
+    permitId: permit.permitId,
+    requestId,
+    status: "succeeded",
+    observedAt: new Date().toISOString(),
+    verificationStatus: "unverified",
+    evidenceRefs: [`observation:${requestId}:upstream-read-complete`],
+  };
+  await governance.recordObservationOutcome(outcome);
+  return result;
 }

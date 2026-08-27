@@ -4,10 +4,12 @@ Wrapper-owned P3 Gatekeeper for one deployment-approved synthetic Google Spreads
 
 It reuses the pinned Cloudflare OS Google OAuth and Sheets implementation, but replaces the
 agent-visible session with `readApprovedRange()`. The spreadsheet ID and A1 range are deployment
-secrets, so callers cannot select or expand them. Cloudflare OS `ApprovalQueue` authorization
+secrets, so callers cannot select or expand them. The private OM Governance Runtime prepares the
+exact observation against its current governance state. Cloudflare OS `ApprovalQueue` authorization
 completes before the agent-visible range read reaches the upstream Google API; the upstream
-post-read observation record remains as defense in depth. This is not an OM OS Canonical Runtime
-Authorization connection and does not grant OM OS Authority or Permission.
+post-read observation record remains as defense in depth. The Runtime enforces already-bound
+Authority and Permission references; neither the Guard nor Runtime creates organizational
+Authority or Permission.
 
 ## Enforced boundary
 
@@ -32,6 +34,12 @@ The inherited OAuth/identity flow and observer ACL verification are control-plan
 may contact Google without the per-range `ApprovalQueue` check described above. The wrapper's
 pre-authorization guarantee applies to the agent-visible `readApprovedRange()` data-plane call,
 not to every HTTP request in the inherited Google integration.
+
+After the discrete ApprovalQueue gate, the OM Runtime revalidates the state, policy, resource
+binding, authority, permission, and scope, then issues and consumes a short-lived single-use
+observation permit
+immediately before the upstream read. The result is returned only after outcome evidence has been
+recorded. The connector has no fallback when the Runtime binding is unavailable.
 
 ## Required Worker secrets
 

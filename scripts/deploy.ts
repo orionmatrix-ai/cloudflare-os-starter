@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -26,6 +27,7 @@ const packageDirs = {
   scheduler: "cloudflare-os/packages/gatekeeper-scheduler",
   customGatekeeper: "packages/custom-gatekeeper",
   googleSheetsGuard: "packages/google-sheets-guard",
+  omGovernanceRuntime: "packages/om-governance-runtime",
   errorReporter: "packages/error-reporter",
 } as const;
 const generatedPaths = Object.fromEntries(
@@ -33,6 +35,21 @@ const generatedPaths = Object.fromEntries(
 ) as Record<keyof typeof packageDirs, string>;
 const defaultContextArtifactsNamespace = "gatekeeper-context-collections";
 const accountIdPattern = /^[a-f\d]{32}$/i;
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).toSorted().map(
+      (key) => `${JSON.stringify(key)}:${stableJson(record[key])}`,
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function governancePolicyHash(policy: object): string {
+  return `sha256:${createHash("sha256").update(stableJson(policy)).digest("hex")}`;
+}
 
 const requiredPaths = [
   "accountId",
@@ -69,6 +86,10 @@ const errorReportingPaths = [
 
 const googleSheetsGuardPaths = [
   "workers.googleSheetsGuard.name",
+];
+
+const governanceRuntimePaths = [
+  "workers.omGovernanceRuntime.name",
 ];
 
 const resourcePaths = [
@@ -172,11 +193,102 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
     throw new Error(
       "Google Sheets Guard configuration must be an object with boolean enabled.");
   }
+  const governanceRuntime = config.governanceRuntime;
+  if (governanceRuntime !== undefined &&
+      (governanceRuntime === null || typeof governanceRuntime !== "object" ||
+       Array.isArray(governanceRuntime) || typeof governanceRuntime.enabled !== "boolean")) {
+    throw new Error("Governance Runtime configuration must be an object with boolean enabled.");
+  }
+  if (config.googleSheetsGuard?.enabled && !governanceRuntime?.enabled) {
+    throw new Error(
+      "googleSheetsGuard.enabled requires governanceRuntime.enabled; no ungoverned fallback is permitted.");
+  }
+  if (governanceRuntime?.enabled && !config.googleSheetsGuard?.enabled) {
+    throw new Error(
+      "governanceRuntime.enabled requires googleSheetsGuard.enabled in the current P3 adapter deployment.");
+  }
+  if (governanceRuntime?.enabled) {
+    const runtimeKeys = [
+      "enabled", "deploymentStage", "approvalReference", "retentionApprovalReference",
+      "runtimeEnablementApproved", "policy",
+    ].toSorted();
+    if (JSON.stringify(Object.keys(governanceRuntime).toSorted()) !== JSON.stringify(runtimeKeys)) {
+      throw new Error("governanceRuntime has unknown or missing enabled-stage fields.");
+    }
+    if (governanceRuntime.deploymentStage !== "p3-evaluation") {
+      throw new Error("governanceRuntime.deploymentStage must be p3-evaluation.");
+    }
+    if (typeof governanceRuntime.approvalReference !== "string" ||
+        !governanceRuntime.approvalReference.trim()) {
+      throw new Error("governanceRuntime.approvalReference must identify the P3 Human Gate.");
+    }
+    if (typeof governanceRuntime.retentionApprovalReference !== "string" ||
+        !governanceRuntime.retentionApprovalReference.trim()) {
+      throw new Error(
+        "governanceRuntime.retentionApprovalReference must identify the retention Human Gate.");
+    }
+    if (governanceRuntime.runtimeEnablementApproved !== true) {
+      throw new Error("governanceRuntime.runtimeEnablementApproved must be true before deployment.");
+    }
+    const policy = governanceRuntime.policy as unknown as Record<string, unknown>;
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+      throw new Error("governanceRuntime.policy must be an object.");
+    }
+    const policyKeys = [
+      "policyId", "principalId", "capabilityId", "authorityId", "permissionId",
+      "operation", "service", "dataClass", "preparationTtlSeconds", "permitTtlSeconds",
+      "recordRetentionSeconds", "mandatoryHumanGate", "initialState",
+      "initialMeasurementConfidence",
+    ].toSorted();
+    if (JSON.stringify(Object.keys(policy).toSorted()) !== JSON.stringify(policyKeys)) {
+      throw new Error("governanceRuntime.policy has unknown or missing fields.");
+    }
+    for (const key of [
+      "policyId", "principalId", "capabilityId", "authorityId", "permissionId",
+    ]) {
+      if (typeof policy[key] !== "string" || !(policy[key] as string).trim()) {
+        throw new Error(`governanceRuntime.policy.${key} must be a non-empty string.`);
+      }
+    }
+    if (policy.operation !== "google.sheets.range.read" || policy.service !== "google-sheets" ||
+        policy.dataClass !== "synthetic") {
+      throw new Error("governanceRuntime.policy is outside the P3 synthetic read boundary.");
+    }
+    if (policy.mandatoryHumanGate !== true) {
+      throw new Error("governanceRuntime.policy.mandatoryHumanGate must remain true.");
+    }
+    if (!Number.isSafeInteger(policy.preparationTtlSeconds) ||
+        (policy.preparationTtlSeconds as number) < 10 ||
+        (policy.preparationTtlSeconds as number) > 300) {
+      throw new Error("governanceRuntime.policy.preparationTtlSeconds must be 10..300.");
+    }
+    if (!Number.isSafeInteger(policy.permitTtlSeconds) ||
+        (policy.permitTtlSeconds as number) < 1 ||
+        (policy.permitTtlSeconds as number) > 60) {
+      throw new Error("governanceRuntime.policy.permitTtlSeconds must be 1..60.");
+    }
+    if (!Number.isSafeInteger(policy.recordRetentionSeconds) ||
+        (policy.recordRetentionSeconds as number) < 3_600 ||
+        (policy.recordRetentionSeconds as number) > 604_800) {
+      throw new Error("governanceRuntime.policy.recordRetentionSeconds must be 3600..604800.");
+    }
+    const stateKeys = ["E", "K", "U", "R", "C", "D", "L", "A", "X"].toSorted();
+    for (const vectorName of ["initialState", "initialMeasurementConfidence"]) {
+      const vector = policy[vectorName] as Record<string, unknown>;
+      if (!vector || typeof vector !== "object" || Array.isArray(vector) ||
+          JSON.stringify(Object.keys(vector).toSorted()) !== JSON.stringify(stateKeys) ||
+          !Object.values(vector).every((value) => typeof value === "number" &&
+            Number.isFinite(value) && value >= 0 && value <= 1)) {
+        throw new Error(`governanceRuntime.policy.${vectorName} must contain exact E..X unit values.`);
+      }
+    }
+  }
   const activePaths = [
     ...requiredPaths,
     ...(config.aiGateway?.enabled ? aiGatewayPaths : []),
     ...(config.errorReporting?.enabled ? errorReportingPaths : []),
     ...(config.googleSheetsGuard?.enabled ? googleSheetsGuardPaths : []),
+    ...(config.governanceRuntime?.enabled ? governanceRuntimePaths : []),
   ];
   for (const path of activePaths) {
     const value = valueAt(config, path);
@@ -228,11 +340,12 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
   const workerNames = Object.entries(config.workers)
     .filter(([key, worker]) => worker !== undefined &&
       (key !== "errorReporter" || config.errorReporting.enabled) &&
-      (key !== "googleSheetsGuard" || config.googleSheetsGuard?.enabled))
+      (key !== "googleSheetsGuard" || config.googleSheetsGuard?.enabled) &&
+      (key !== "omGovernanceRuntime" || config.governanceRuntime?.enabled))
     .map(([, worker]) => worker!.name);
   if (new Set(workerNames).size !== workerNames.length) {
     throw new Error(
-      "Router, Workshop, Context, Scheduler, and custom Gatekeeper names must be unique.");
+      "All enabled Worker names must be unique.");
   }
   if (!workerNames.every((name) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name))) {
     throw new Error("Worker names must use lowercase letters, numbers, and hyphens.");
@@ -445,6 +558,19 @@ function setCommon(
 
 export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): GeneratedConfigs {
   validateConfig(config);
+  const activeGovernanceRuntime = config.governanceRuntime?.enabled
+    ? config.governanceRuntime
+    : undefined;
+  const activeGovernancePolicy = activeGovernanceRuntime
+    ? (() => {
+        const policyInput = {
+          ...activeGovernanceRuntime.policy,
+          deploymentApprovalReference: activeGovernanceRuntime.approvalReference,
+          trustedCallerId: "google-sheets-guard",
+        };
+        return { ...policyInput, policyHash: governancePolicyHash(policyInput) };
+      })()
+    : undefined;
   const router = structuredClone(bases.router);
   const workshop = structuredClone(bases.workshop);
   const context = structuredClone(bases.context);
@@ -452,6 +578,9 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   const customGatekeeper = structuredClone(bases.customGatekeeper);
   const googleSheetsGuard = config.googleSheetsGuard?.enabled
     ? structuredClone(bases.googleSheetsGuard)
+    : undefined;
+  const omGovernanceRuntime = config.governanceRuntime?.enabled
+    ? structuredClone(bases.omGovernanceRuntime)
     : undefined;
   const errorReporter = config.errorReporting.enabled
     ? structuredClone(bases.errorReporter)
@@ -580,16 +709,55 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   };
 
   if (googleSheetsGuard) {
+    if (!activeGovernanceRuntime) throw new Error("enabled guard requires Governance Runtime.");
     setCommon(googleSheetsGuard, config, config.workers.googleSheetsGuard!.name);
+    if (!activeGovernancePolicy) throw new Error("enabled guard requires governance policy.");
     googleSheetsGuard.vars = {
       BASE_URL: `${origin}/gatekeeper/google-sheets-guard`,
+      OM_GOVERNANCE_POLICY_HASH: activeGovernancePolicy.policyHash,
+      OM_GOVERNANCE_PRINCIPAL_ID: activeGovernancePolicy.principalId,
+      OM_GOVERNANCE_CAPABILITY_ID: activeGovernancePolicy.capabilityId,
+      OM_GOVERNANCE_AUTHORITY_ID: activeGovernancePolicy.authorityId,
+      OM_GOVERNANCE_PERMISSION_ID: activeGovernancePolicy.permissionId,
     };
+    googleSheetsGuard.services = [
+      ...(googleSheetsGuard.services ?? []),
+      {
+        binding: "OM_GOVERNANCE",
+        service: config.workers.omGovernanceRuntime!.name,
+        entrypoint: "GovernanceRuntimeService",
+        props: { callerId: "google-sheets-guard" },
+      },
+    ];
     googleSheetsGuard.secrets = {
       required: [
         "CLIENT_ID",
         "CLIENT_SECRET",
         "P3_SPREADSHEET_ID",
         "P3_ALLOWED_RANGE",
+      ],
+    };
+  }
+
+  if (omGovernanceRuntime) {
+    if (!activeGovernanceRuntime) throw new Error("enabled Governance Runtime requires configuration.");
+    if (!activeGovernancePolicy) throw new Error("enabled Governance Runtime requires policy.");
+    setCommon(omGovernanceRuntime, config, config.workers.omGovernanceRuntime!.name);
+    omGovernanceRuntime.vars = {
+      OM_GOVERNANCE_POLICY: JSON.stringify(activeGovernancePolicy),
+      OM_GOVERNANCE_ACCOUNT_ID: config.accountId,
+      OM_GOVERNANCE_RUNTIME_WORKER: config.workers.omGovernanceRuntime!.name,
+      OM_GOVERNANCE_ADAPTER_WORKER: config.workers.googleSheetsGuard!.name,
+      OM_GOVERNANCE_STAGE: activeGovernanceRuntime.deploymentStage,
+      OM_GOVERNANCE_RETENTION_APPROVAL_ID:
+        activeGovernanceRuntime.retentionApprovalReference,
+    };
+    omGovernanceRuntime.secrets = {
+      required: [
+        "P3_SPREADSHEET_ID",
+        "P3_ALLOWED_RANGE",
+        "OM_GOVERNANCE_DEPLOYMENT_APPROVAL",
+        "OM_GOVERNANCE_RETENTION_CONTROL",
       ],
     };
   }
@@ -601,6 +769,7 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   return {
     router, workshop, context, scheduler, customGatekeeper,
     ...(googleSheetsGuard && { googleSheetsGuard }),
+    ...(omGovernanceRuntime && { omGovernanceRuntime }),
     ...(errorReporter && { errorReporter }),
   };
 }
@@ -648,6 +817,7 @@ export function buildCommands(config: DeploymentConfig): BuildCommand[] {
     { args: submoduleBuild("@gadgets/gatekeeper-scheduler", "build:app") },
     { args: submoduleBuild("@gadgets/gatekeeper-scheduler") },
     { args: ownBuild("custom-gatekeeper") },
+    ...(config.governanceRuntime?.enabled ? [{ args: ownBuild("om-governance-runtime") }] : []),
     ...(config.googleSheetsGuard?.enabled ? [
       // The wrapper inherits the pinned Google worker. Its imported module references generated
       // configurator assets even though this facade never exposes the picker, so build them from
@@ -771,6 +941,7 @@ async function main(): Promise<void> {
     scheduler: await readJsonc(join(root, packageDirs.scheduler, "wrangler.jsonc")),
     customGatekeeper: await readJsonc(join(root, packageDirs.customGatekeeper, "wrangler.jsonc")),
     googleSheetsGuard: await readJsonc(join(root, packageDirs.googleSheetsGuard, "wrangler.jsonc")),
+    omGovernanceRuntime: await readJsonc(join(root, packageDirs.omGovernanceRuntime, "wrangler.jsonc")),
     errorReporter: await readJsonc(join(root, packageDirs.errorReporter, "wrangler.jsonc")),
   });
   reportAiGateway(config);
@@ -791,6 +962,9 @@ async function main(): Promise<void> {
     deployWorker(packageDirs.context, deployArgs);
     deployWorker(packageDirs.scheduler, deployArgs);
     deployWorker(packageDirs.customGatekeeper, deployArgs);
+    if (config.governanceRuntime?.enabled) {
+      deployWorker(packageDirs.omGovernanceRuntime, deployArgs);
+    }
     if (config.googleSheetsGuard?.enabled) {
       deployWorker(packageDirs.googleSheetsGuard, deployArgs);
     }

@@ -70,6 +70,7 @@ export class GuardedGoogleSheetSessionImpl extends RpcTarget
     private readonly approvalQueue: ObservationQueue,
     private readonly upstream: UpstreamReader,
     private readonly config: GuardConfig,
+    private readonly governance: NonNullable<GuardEnv["OM_GOVERNANCE"]>,
   ) {
     super();
   }
@@ -77,7 +78,13 @@ export class GuardedGoogleSheetSessionImpl extends RpcTarget
   async readApprovedRange(
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange> {
-    return readAfterAuthorization(this.approvalQueue, this.upstream, this.config, options);
+    return readAfterAuthorization(
+      this.approvalQueue,
+      this.upstream,
+      this.config,
+      this.governance,
+      options,
+    );
   }
 
   async getSpreadsheet(): Promise<SpreadsheetInfo> {
@@ -126,10 +133,14 @@ export class GoogleSheetsGatekeeperImpl extends UpstreamSheetsGatekeeper
     approvalQueue: RpcStub<ApprovalQueue>,
   ): Promise<GuardedGoogleSheetSession & GoogleSpreadsheetSession> {
     const config = parseGuardConfig(this.env as GuardEnv);
+    const governance = (this.env as GuardEnv).OM_GOVERNANCE;
+    if (!governance) {
+      throw new Error("OM_GOVERNANCE service binding is required; no fallback is permitted.");
+    }
     // Keep upstream's own observation record as defense in depth. The wrapper performs the first
     // authorization before invoking the upstream API, so no remote read occurs if it is denied.
     const upstream = await super.startSession(approvalQueue.dup());
-    return new GuardedGoogleSheetSessionImpl(approvalQueue.dup(), upstream, config);
+    return new GuardedGoogleSheetSessionImpl(approvalQueue.dup(), upstream, config, governance);
   }
 }
 
