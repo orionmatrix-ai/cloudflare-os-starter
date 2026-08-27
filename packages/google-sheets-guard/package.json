@@ -15,6 +15,7 @@
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "mimetext": "^3.0.28",
+    "om-governance-runtime": "workspace:*",
     "postal-mime": "^2.7.6"
   },
   "devDependencies": {

@@ -150,9 +150,33 @@ importers:
       mimetext:
         specifier: ^3.0.28
         version: 3.0.28
+      om-governance-runtime:
+        specifier: workspace:*
+        version: link:../om-governance-runtime
       postal-mime:
         specifier: ^2.7.6
         version: 2.7.6
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: 'catalog:'
+        version: 0.20.3(@cloudflare/workers-types@5.20260818.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+      '@types/node':
+        specifier: 26.1.0
+        version: 26.1.0
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vite:
+        specifier: 7.3.6
+        version: 7.3.6(@types/node@26.1.0)(lightningcss@1.33.0)
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.10(@types/node@26.1.0)(@vitest/browser-preview@4.1.10)(vite@7.3.6(@types/node@26.1.0)(lightningcss@1.33.0))
+      wrangler:
+        specifier: 'catalog:'
+        version: 4.124.0(@cloudflare/workers-types@5.20260818.1)
+
+  packages/om-governance-runtime:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'

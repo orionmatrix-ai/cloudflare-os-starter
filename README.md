@@ -39,6 +39,7 @@ This repository adds deployment controls around a pinned [Cloudflare OS](https:/
 | Routing | A production [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) or a `workers.dev` evaluation route |
 | Data | Existing KV/R2 resources or [automatic provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning) |
 | Integrations | Wrapper-owned Gatekeepers and service bindings without patching upstream |
+| OM governance | Private stateful Runtime binding with exact-scope preparation, discrete gate, revalidation, single-use permits, and outcome feedback |
 | AI | A [Workers AI](https://developers.cloudflare.com/workers-ai/) model catalog through [AI Gateway](https://developers.cloudflare.com/ai-gateway/) out of the box, with no API token; which providers and which gateway |
 | Operations | [Structured logs, traces, explicit error reports](docs/observability.md), validation, deployment order, and upgrades |
 
@@ -46,9 +47,11 @@ This repository adds deployment controls around a pinned [Cloudflare OS](https:/
 
 <img src="docs/assets/architecture.svg" alt="Cloudflare OS deployment architecture: users reach one public route, owned by the router Worker, which serves the frontend and proxies /api to the Workshop backend and /gatekeeper/&lt;name&gt; to the matching Gatekeeper. Behind it is the pinned Cloudflare OS release, holding the Workshop kernel, Gadgets, Blueprints, and the default Gatekeepers. Service bindings connect it to the Workers and resources this repository owns: AI Gateway with no API token, custom Gatekeepers, the Error Reporter, and KV and R2 storage.">
 
-The default deployment is six Workers, with an optional seventh Google Sheets Guard Worker. A **router** owns the public route and serves the frontend, proxying `/api` to the Workshop backend and `/gatekeeper/<name>` to whichever Gatekeeper the binding name matches; the Workshop, the Context, Scheduler and custom Gatekeepers, the optional Google Sheets Guard, and the Error Reporter sit behind it with no route of their own, reachable only over service bindings.
+The default deployment is six Workers. Enabling the Google Sheets Guard adds both the private Guard Worker and a private OM Governance Runtime Worker. A **router** owns the public route and serves the frontend, proxying `/api` to the Workshop backend and `/gatekeeper/<name>` to whichever Gatekeeper the binding name matches; the Workshop, the Context, Scheduler and custom Gatekeepers, the optional guarded connector and governance runtime, and the Error Reporter sit behind it with no route of their own, reachable only over service bindings.
 
-The deploy command derives temporary Wrangler files from upstream base configs, builds the frontend in Cloudflare Access mode, deploys the private Error Reporter, the Gatekeepers and the Workshop before the router that binds them, and removes generated files even on failure. Secrets never enter tracked configuration.
+The deploy command derives temporary Wrangler files from upstream base configs, builds the frontend in Cloudflare Access mode, deploys the private Error Reporter, governance runtime, Gatekeepers and Workshop before the router that binds them, and removes generated files even on failure. Secrets never enter tracked configuration.
+
+The OM Governance Runtime keeps `E/K/U/R/C/D/L/A/X` and measurement confidence separately. A guarded read is prepared against the current state, passes the Cloudflare OS `ApprovalQueue` as a discrete gate, is revalidated, receives a short-lived single-use observation permit, and returns success or failure evidence before data is released. Model confidence is not an input, and successful reads cannot expand authority, permission, scope, or relax the mandatory gate. See [OM Governance Runtime](packages/om-governance-runtime/README.md).
 
 ### If you only want branding
 

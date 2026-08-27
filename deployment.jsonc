@@ -34,6 +34,7 @@
 
     "customGatekeeper": { "name": "<CUSTOM_GATEKEEPER_WORKER_NAME>" },
     "googleSheetsGuard": { "name": "<GOOGLE_SHEETS_GUARD_WORKER_NAME>" },
+    "omGovernanceRuntime": { "name": "<OM_GOVERNANCE_RUNTIME_WORKER_NAME>" },
     "errorReporter": { "name": "<ERROR_REPORTER_WORKER_NAME>" }
   },
 
@@ -98,6 +99,13 @@
   // declares four required Worker secrets. It does not create OAuth credentials or install them.
   // The facade exposes one deployment-approved spreadsheet and one fixed A1 range only.
   "googleSheetsGuard": {
+    "enabled": false
+  },
+
+  // Required before googleSheetsGuard can be enabled. The policy is added only for an enabled
+  // deployment; spreadsheet ID, A1 range, exact deployment approval, and retention-control
+  // manifests remain Worker secrets and are never tracked here.
+  "governanceRuntime": {
     "enabled": false
   },
 
