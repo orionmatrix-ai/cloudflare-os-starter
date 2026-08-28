@@ -110,6 +110,7 @@ function governanceBinding(order: string[] = []): GovernanceRuntimeBinding {
       };
     }),
     getStateSnapshot: vi.fn(),
+    getOMSystemState: vi.fn(),
   };
 }
 
@@ -254,15 +255,21 @@ describe("P3 Google Sheets guard", () => {
     expect(() => gatekeeper.revertAction(1)).toThrow(/read-only/);
   });
 
-  it("rejects sign-in and resource discovery through the actual wrapper classes", async () => {
+  it("keeps sign-in and resource discovery disabled while exposing exact URL entry", async () => {
     const vendorDescription = await GatekeeperVendor.prototype.describe.call(
       {} as GatekeeperVendor,
     );
     expect(vendorDescription.providesAuth).toBe(false);
-    expect(() => GatekeeperUserImpl.prototype.startResourceConfigurator.call(
+    const configurator = await GatekeeperUserImpl.prototype.startResourceConfigurator.call(
       {} as GatekeeperUserImpl,
       SHEETS_RESOURCE_PATTERN,
-    )).toThrow(/Resource search is disabled/);
+    );
+    expect(configurator.iframeHtml).toBeTruthy();
+    expect(configurator.ui).toBeDefined();
+    await expect(GatekeeperUserImpl.prototype.startResourceConfigurator.call(
+      {} as GatekeeperUserImpl,
+      "https://docs.google.com/document/d/:documentId/*",
+    )).rejects.toThrow(/Only the deployment-approved Google Spreadsheet/);
     await expect(GatekeeperUserImpl.prototype.ensureResources.call(
       {} as GatekeeperUserImpl,
       ["https://mail.google.com/*"],

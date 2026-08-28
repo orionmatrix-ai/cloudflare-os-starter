@@ -18,8 +18,10 @@ import {
   type ObservationPermit,
   type ObservationPreparation,
   type ObservationScope,
+  type OMSystemStateView,
   type PermitConsumption,
   type StateSnapshot,
+  type StateRateVector,
   type StateVector,
 } from "./contracts.js";
 
@@ -87,6 +89,7 @@ export class MemoryGovernanceStore implements GovernanceStore {
 }
 
 const STATE_KEY = "governance-state";
+const PREVIOUS_STATE_KEY = "governance-state-previous";
 const RETENTION_PREFIXES = [
   "preparation:", "permit:", "request:", "gate:", "purge-evidence:",
   "retention-quarantine:",
@@ -348,12 +351,13 @@ export function parseDeploymentApproval(
   }
   assert(isObject(value), "OM_GOVERNANCE_DEPLOYMENT_APPROVAL must be an object.");
   exactKeys(value, [
-    "schemaVersion", "approvalId", "policyHash", "deploymentBindingFingerprint", "accountId",
+    "schemaVersion", "approvalId", "artifactRevision", "policyHash",
+    "deploymentBindingFingerprint", "accountId",
     "runtimeWorkerName", "adapterWorkerName", "stage", "approvedAt", "expiresAt", "revoked",
   ], "OM_GOVERNANCE_DEPLOYMENT_APPROVAL");
-  assert(value.schemaVersion === "1.0", "deployment approval schemaVersion is unsupported.");
+  assert(value.schemaVersion === "1.1", "deployment approval schemaVersion is unsupported.");
   for (const key of [
-    "approvalId", "policyHash", "deploymentBindingFingerprint", "accountId", "runtimeWorkerName",
+    "approvalId", "artifactRevision", "policyHash", "deploymentBindingFingerprint", "accountId", "runtimeWorkerName",
     "adapterWorkerName", "stage",
   ] as const) nonempty(value[key], `deployment approval.${key}`);
   const approvedAt = timestamp(value.approvedAt, "deployment approval.approvedAt");
@@ -460,6 +464,67 @@ export function validateIntent(value: ObservationIntent, policy: GovernancePolic
 
 function clip(value: number): number {
   return Math.round(Math.max(0, Math.min(1, value)) * 1_000_000) / 1_000_000;
+}
+
+function rounded(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+export function deriveStateRate(
+  current: StateSnapshot,
+  previous?: StateSnapshot,
+): {
+  rawDelta: StateRateVector;
+  ratePerDay: StateRateVector;
+  rateBasisSeconds: number | null;
+  rateAssessment: "insufficient-history" | "insufficient-basis" | "usable";
+} {
+  const unavailable = Object.fromEntries(STATE_KEYS.map((key) => [key, null])) as StateRateVector;
+  if (!previous) {
+    return {
+      rawDelta: unavailable,
+      ratePerDay: unavailable,
+      rateBasisSeconds: null,
+      rateAssessment: "insufficient-history",
+    };
+  }
+  const elapsedMilliseconds = Date.parse(current.updatedAt) - Date.parse(previous.updatedAt);
+  if (!Number.isFinite(elapsedMilliseconds) || elapsedMilliseconds <= 0) {
+    return {
+      rawDelta: unavailable,
+      ratePerDay: unavailable,
+      rateBasisSeconds: null,
+      rateAssessment: "insufficient-basis",
+    };
+  }
+  const rateBasisSeconds = elapsedMilliseconds / 1_000;
+  const rawDelta = Object.fromEntries(STATE_KEYS.map((key) => [
+    key,
+    rounded(current.components[key] - previous.components[key]),
+  ])) as StateRateVector;
+  if (rateBasisSeconds < 300) {
+    return {
+      rawDelta,
+      ratePerDay: unavailable,
+      rateBasisSeconds: rounded(rateBasisSeconds),
+      rateAssessment: "insufficient-basis",
+    };
+  }
+  const ratePerDay = Object.fromEntries(STATE_KEYS.map((key) => [
+    key,
+    rounded((rawDelta[key] as number) * 86_400 / rateBasisSeconds),
+  ])) as StateRateVector;
+  return {
+    rawDelta,
+    ratePerDay,
+    rateBasisSeconds: rounded(rateBasisSeconds),
+    rateAssessment: "usable",
+  };
+}
+
+async function assertSnapshotIntegrity(snapshot: StateSnapshot, name: string): Promise<void> {
+  const { contentHash, ...body } = snapshot;
+  assert(await fingerprint(body) === contentHash, `${name} content hash mismatch.`);
 }
 
 export function deriveEnvelope(state: StateSnapshot, policy: GovernancePolicy): GovernanceEnvelope {
@@ -573,6 +638,102 @@ export class GovernanceEngine {
     );
     await this.store.put(STATE_KEY, created);
     return created;
+  }
+
+  async getOMSystemState(): Promise<OMSystemStateView> {
+    const current = await this.getStateSnapshot();
+    await assertSnapshotIntegrity(current, "current state");
+    const previous = await this.store.get<StateSnapshot>(PREVIOUS_STATE_KEY);
+    if (previous) {
+      await assertSnapshotIntegrity(previous, "previous state");
+      assert(previous.policyHash === current.policyHash,
+        "previous state policy binding mismatch.");
+      assert(previous.deploymentBindingFingerprint === current.deploymentBindingFingerprint,
+        "previous state deployment binding mismatch.");
+      assert(previous.version === current.version - 1,
+        "previous state is not the immediate predecessor.");
+    }
+    const envelope = deriveEnvelope(current, this.policy);
+    const rate = deriveStateRate(current, previous);
+    const { E, K, U, R, C, D, L, A, X } = current.components;
+    return {
+      schemaVersion: "1.0",
+      subjectType: "system-self",
+      epistemicStatus: "estimated",
+      observedAt: current.updatedAt,
+      baseSnapshot: {
+        snapshotId: current.snapshotId,
+        version: current.version,
+        contentHash: current.contentHash,
+        previousSnapshotId: previous?.snapshotId ?? null,
+      },
+      dynamics: {
+        current: structuredClone(current.components),
+        rawDelta: rate.rawDelta,
+        ratePerDay: rate.ratePerDay,
+        rateBasisSeconds: rate.rateBasisSeconds,
+        rateAssessment: rate.rateAssessment,
+        calibrated: false,
+        updateBasis: "policy-initialized-and-unverified-outcome-adjusted",
+        measurementConfidence: structuredClone(current.measurementConfidence),
+      },
+      knowledgeState: {
+        evidenceQuality: E,
+        knowledgeIntegrity: K,
+        uncertainty: U,
+        unresolvedConflictIndex: C,
+      },
+      governanceState: {
+        risk: R,
+        uncertainty: U,
+        policyConflict: C,
+        policyDrift: D,
+        authorityCeilingId: envelope.authorityCeilingId,
+        humanGate: "mandatory",
+        verificationIntensity: envelope.verificationIntensity,
+        modelRoutingRequirement: envelope.modelRoutingRequirement,
+      },
+      agentState: {
+        activityIndex: A,
+        configuredPrincipalId: this.policy.principalId,
+        configuredCallerId: this.policy.trustedCallerId,
+        activeAgentTelemetry: "not-observed",
+        modelSelfReportedConfidenceAccepted: false,
+      },
+      executionState: {
+        exposureIndex: X,
+        configuredOperation: this.policy.operation,
+        configuredService: this.policy.service,
+        lifecycleTelemetry: "not-observed",
+      },
+      systemHealth: {
+        loadIndex: L,
+        driftIndex: D,
+        riskIndex: envelope.riskIndex,
+        minimumMeasurementConfidence: envelope.minimumMeasurementConfidence,
+        errorRate: null,
+        cost: null,
+        processingLatencyMs: null,
+      },
+      evidence: {
+        refs: [...current.evidenceRefs],
+        verificationStatus: "unverified",
+        sourceSnapshotHash: current.contentHash,
+      },
+      controlBoundaries: {
+        authorityExpansionAllowed: false,
+        permissionExpansionAllowed: false,
+        scopeExpansionAllowed: false,
+        automaticGateRelaxationAllowed: false,
+        executionAuthorizationGenerated: false,
+      },
+      blindSpots: [
+        "active agent identities and model selections are not observed by this runtime slice",
+        "execution lifecycle counts are not yet aggregated",
+        "error rate, cost, and processing latency telemetry are not yet ingested",
+        "outcomes remain unverified until a separate verifier ingestion path is implemented",
+      ],
+    };
   }
 
   async prepareObservation(rawIntent: ObservationIntent): Promise<ObservationPreparation> {
@@ -793,6 +954,7 @@ export class GovernanceEngine {
       );
       permit.outcomeRecorded = true;
       await putRetainedRecord(transaction, permitKey(permit.permitId), permit);
+      await transaction.put(PREVIOUS_STATE_KEY, transactionalState);
       await transaction.put(STATE_KEY, next);
       return next;
     });

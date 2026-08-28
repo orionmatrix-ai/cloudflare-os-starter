@@ -6,7 +6,7 @@
   "main": "./src/index.ts",
   "scripts": {
     "types:check": "tsc --noEmit",
-    "test:run": "pnpm --dir ../../cloudflare-os exec vp run -F @gadgets/google-gatekeeper --no-cache build:configurator && vitest run"
+    "test:run": "node ../../cloudflare-os/scripts/build-gatekeeper-configurator.ts . && vitest run"
   },
   "dependencies": {
     "@gadgets/backend-utils": "link:../../cloudflare-os/packages/backend-utils",

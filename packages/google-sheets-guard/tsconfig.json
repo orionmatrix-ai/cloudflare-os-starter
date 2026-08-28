@@ -5,6 +5,8 @@
     "lib": ["ESNext"],
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "jsx": "react",
+    "jsxFactory": "h",
     "types": ["../../cloudflare-os/packages/gatekeeper-google/worker-configuration.d.ts"],
     "noEmit": true
   },

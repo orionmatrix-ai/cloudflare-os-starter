@@ -6,12 +6,14 @@ import type {
   ObservationIntent,
   ObservationIntentRequest,
   ObservationOutcome,
+  OMSystemStateView,
   PermitAuthorizationRequest,
   PermitConsumption,
   PermitConsumptionRequest,
   PurgeResult,
   StateSnapshot,
 } from "./contracts.js";
+import { GOVERNANCE_ARTIFACT_REVISION } from "./contracts.js";
 import {
   GovernanceEngine,
   deploymentBindingFingerprint,
@@ -120,6 +122,10 @@ export class GovernanceRuntimeState extends DurableObject<GovernanceEnv> {
     return this.state.blockConcurrencyWhile(() => this.engine.getStateSnapshot());
   }
 
+  getOMSystemState(): Promise<OMSystemStateView> {
+    return this.state.blockConcurrencyWhile(() => this.engine.getOMSystemState());
+  }
+
   alarm(): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
       let result: PurgeResult;
@@ -177,6 +183,7 @@ export class GovernanceRuntimeService extends WorkerEntrypoint<GovernanceEnv, Go
     const policy = this.policy();
     parseDeploymentApproval(this.env.OM_GOVERNANCE_DEPLOYMENT_APPROVAL, {
       approvalId: policy.deploymentApprovalReference,
+      artifactRevision: GOVERNANCE_ARTIFACT_REVISION,
       policyHash: policy.policyHash,
       deploymentBindingFingerprint: fingerprint,
       accountId: this.env.OM_GOVERNANCE_ACCOUNT_ID,
@@ -223,6 +230,11 @@ export class GovernanceRuntimeService extends WorkerEntrypoint<GovernanceEnv, Go
   async getStateSnapshot(): Promise<StateSnapshot> {
     this.assertCaller();
     return (await this.runtime()).getStateSnapshot();
+  }
+
+  async getOMSystemState(): Promise<OMSystemStateView> {
+    this.assertCaller();
+    return (await this.runtime()).getOMSystemState();
   }
 }
 
