@@ -32,6 +32,29 @@ confidence is a separate vector. The caller cannot submit either vector, and mod
 never accepted as governance state. Successful observations do not expand authority, permission,
 scope, or relax the mandatory human gate.
 
+## OM System State view
+
+`getOMSystemState()` exposes a private, read-only `subjectType: system-self` view over the current
+Governance State Snapshot. It is self-observation plus state estimation, not consciousness or a
+self-reported model belief. The view combines:
+
+- the current `E`, `K`, `U`, `R`, `C`, `D`, `L`, `A`, and `X` vector;
+- raw change from the immediate predecessor and a per-day rate only when the basis is at least five
+  minutes; shorter windows are marked `insufficient-basis` instead of being over-extrapolated;
+- separate Knowledge, Governance, Agent, Execution, and System Health views;
+- the mandatory Human Gate and Authority ceiling as discrete controls rather than continuous state;
+- measurement confidence, Evidence references, and explicit telemetry blind spots.
+
+The view never grants Authority, Permission, scope, gate relaxation, or Execution Authorization.
+Unobserved active-agent details, execution lifecycle counts, error rate, cost, and latency remain
+`not-observed` or `null`; the Runtime does not infer them from missing telemetry. Observation outcomes
+remain `unverified` until a separate verifier ingestion path exists.
+
+The view labels the estimator `calibrated: false` and identifies its update basis as policy-initialized
+state with conservative adjustments from unverified outcomes. Current and previous Snapshot content
+hashes are recomputed, and the previous version must be the immediate predecessor before a delta is
+reported.
+
 The Worker has no public route. Its policy is deployment-managed through
 `OM_GOVERNANCE_POLICY`; the deploy script binds the private Worker to the guarded connector.
 The deploy generator derives the policy hash from canonicalized policy content; operators do not
@@ -46,6 +69,11 @@ manifest containing the approval ID, policy hash, deployment binding fingerprint
 account, Runtime and adapter Worker names, stage, validity window, and revocation state. A mismatch,
 expiry, or revocation fails closed. The manifest is Cloudflare-secret-bound evidence supplied after
 a Human Gate; it is not a substitute for an OM-Knowledge Canonical approval record.
+
+The manifest also binds `artifactRevision` to the Runtime's compiled-in
+`GOVERNANCE_ARTIFACT_REVISION`. Any code release that changes this revision fails closed against an
+older deployment approval secret. A fresh artifact-bound Human Gate and secret update are required
+before that release can be deployed; an older approval reference cannot authorize changed code.
 
 Cloudflare `ApprovalQueue` currently returns no opaque signed approval record. The private service
 binding therefore stamps a trusted connector attestation after the queue call returns. This is a

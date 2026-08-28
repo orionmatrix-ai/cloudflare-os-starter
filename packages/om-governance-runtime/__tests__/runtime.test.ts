@@ -3,13 +3,16 @@ import type {
   GovernancePolicy,
   ObservationIntent,
   RetentionControlManifest,
+  StateSnapshot,
   StateVector,
 } from "../src/contracts.js";
+import { GOVERNANCE_ARTIFACT_REVISION } from "../src/contracts.js";
 import {
   GovernanceEngine,
   MemoryGovernanceStore,
   deploymentBindingFingerprint,
   deriveEnvelope,
+  deriveStateRate,
   fingerprint,
   parseDeploymentApproval,
   parsePolicy,
@@ -164,8 +167,11 @@ describe("OM Governance Runtime", () => {
     engine = new GovernanceEngine(store, activePolicy, () => now, () => `id-${++sequence}`);
   });
 
-  async function permitted() {
-    const preparation = await engine.prepareObservation(intent(now));
+  async function permitted(
+    requestId = "request-1",
+    gateEvidenceId = "cf-approval:request-1",
+  ) {
+    const preparation = await engine.prepareObservation(intent(now, { requestId }));
     now += 1_000;
     const permit = await engine.authorizeObservation({
       preparationId: preparation.preparationId,
@@ -174,7 +180,7 @@ describe("OM Governance Runtime", () => {
       gate: {
         source: "cloudflare-approval-queue",
         attestedBy: "google-sheets-guard",
-        evidenceId: "cf-approval:request-1",
+        evidenceId: gateEvidenceId,
         approvedAt: new Date(now).toISOString(),
       },
     });
@@ -187,9 +193,81 @@ describe("OM Governance Runtime", () => {
     expect(parsed.mandatoryHumanGate).toBe(true);
   });
 
+  it("exposes an evidence-bound system-self view without inventing missing telemetry", async () => {
+    const view = await engine.getOMSystemState();
+    expect(view).toMatchObject({
+      schemaVersion: "1.0",
+      subjectType: "system-self",
+      epistemicStatus: "estimated",
+      baseSnapshot: {
+        snapshotId: "GSS-0",
+        version: 0,
+        previousSnapshotId: null,
+      },
+      knowledgeState: {
+        evidenceQuality: 0.8,
+        knowledgeIntegrity: 0.8,
+        uncertainty: 0.2,
+        unresolvedConflictIndex: 0.1,
+      },
+      governanceState: {
+        risk: 0.2,
+        humanGate: "mandatory",
+        authorityCeilingId: "authority:om-inc:p3-synthetic-read",
+      },
+      agentState: {
+        activityIndex: 0.1,
+        activeAgentTelemetry: "not-observed",
+        modelSelfReportedConfidenceAccepted: false,
+      },
+      executionState: {
+        exposureIndex: 0.2,
+        lifecycleTelemetry: "not-observed",
+      },
+      systemHealth: {
+        loadIndex: 0.2,
+        errorRate: null,
+        cost: null,
+        processingLatencyMs: null,
+      },
+      evidence: { verificationStatus: "unverified" },
+      controlBoundaries: {
+        authorityExpansionAllowed: false,
+        permissionExpansionAllowed: false,
+        scopeExpansionAllowed: false,
+        automaticGateRelaxationAllowed: false,
+        executionAuthorizationGenerated: false,
+      },
+    });
+    expect(Object.values(view.dynamics.rawDelta)).toEqual(Array(9).fill(null));
+    expect(Object.values(view.dynamics.ratePerDay)).toEqual(Array(9).fill(null));
+    expect(view.dynamics.rateBasisSeconds).toBeNull();
+    expect(view.dynamics.rateAssessment).toBe("insufficient-history");
+    expect(view.dynamics.calibrated).toBe(false);
+    expect(view.blindSpots).toHaveLength(4);
+  });
+
+  it("reports a normalized state rate only when the observation basis is sufficient", () => {
+    const previous = {
+      updatedAt: new Date(now).toISOString(),
+      components: initialState,
+    } as StateSnapshot;
+    const current = {
+      updatedAt: new Date(now + 86_400_000).toISOString(),
+      components: { ...initialState, R: 0.3, D: 0.15 },
+    } as StateSnapshot;
+    expect(deriveStateRate(current, previous)).toMatchObject({
+      rawDelta: { R: 0.1, D: 0.05 },
+      ratePerDay: { R: 0.1, D: 0.05 },
+      rateBasisSeconds: 86_400,
+      rateAssessment: "usable",
+    });
+  });
+
   it("binds deployment approval to policy, exact resource fingerprint, account, Workers, and stage", () => {
     const expected = {
       approvalId: "human-gate:p3-runtime-evaluation",
+      artifactRevision: GOVERNANCE_ARTIFACT_REVISION,
       policyHash: activePolicyHash,
       deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
       accountId: "0123456789abcdef0123456789abcdef",
@@ -198,7 +276,7 @@ describe("OM Governance Runtime", () => {
       stage: "p3-evaluation",
     };
     const manifest = {
-      schemaVersion: "1.0",
+      schemaVersion: "1.1",
       ...expected,
       approvedAt: new Date(now - 1_000).toISOString(),
       expiresAt: new Date(now + 60_000).toISOString(),
@@ -213,6 +291,14 @@ describe("OM Governance Runtime", () => {
       ...manifest,
       revoked: true,
     }), expected, now)).toThrow(/revoked/);
+    expect(() => parseDeploymentApproval(JSON.stringify({
+      ...manifest,
+      artifactRevision: "older-artifact",
+    }), expected, now)).toThrow(/artifactRevision binding mismatch/);
+    expect(() => parseDeploymentApproval(JSON.stringify({
+      ...manifest,
+      schemaVersion: "1.0",
+    }), expected, now)).toThrow(/schemaVersion is unsupported/);
   });
 
   it("binds retention control to policy, exact resource, account, Worker, stage, and legal hold", () => {
@@ -694,6 +780,25 @@ describe("OM Governance Runtime", () => {
     expect(next.version).toBe(1);
     expect(next.components).toMatchObject({ E: 0.75, K: 0.78, U: 0.3, R: 0.3, D: 0.15, X: 0.25 });
     expect(next.measurementConfidence.E).toBe(0.79);
+
+    const view = await engine.getOMSystemState();
+    expect(view.baseSnapshot.previousSnapshotId).toBe("GSS-0");
+    expect(view.dynamics.rateBasisSeconds).toBe(1);
+    expect(view.dynamics.rateAssessment).toBe("insufficient-basis");
+    expect(Object.values(view.dynamics.ratePerDay)).toEqual(Array(9).fill(null));
+    expect(view.dynamics.rawDelta).toMatchObject({
+      E: -0.05,
+      K: -0.02,
+      U: 0.1,
+      R: 0.1,
+      D: 0.05,
+      X: 0.05,
+    });
+    expect(view.governanceState).toMatchObject({
+      risk: 0.3,
+      verificationIntensity: "standard",
+      humanGate: "mandatory",
+    });
   });
 
   it("does not relax state on an unverified success", async () => {
@@ -715,6 +820,75 @@ describe("OM Governance Runtime", () => {
     });
     expect(next.components).toEqual(initialState);
     expect(next.measurementConfidence.E).toBe(0.79);
+  });
+
+  it("keeps only the immediate predecessor across consecutive transitions", async () => {
+    const first = await permitted();
+    await engine.consumeObservationPermit({
+      permitId: first.permit.permitId,
+      requestId: first.permit.requestId,
+      operation: "google.sheets.range.read",
+      scope: first.permit.scope,
+      deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+    });
+    await engine.recordObservationOutcome({
+      permitId: first.permit.permitId,
+      requestId: first.permit.requestId,
+      status: "succeeded",
+      observedAt: new Date(now).toISOString(),
+      verificationStatus: "unverified",
+      evidenceRefs: ["outcome:first"],
+    });
+
+    const second = await permitted("request-2", "cf-approval:request-2");
+    await engine.consumeObservationPermit({
+      permitId: second.permit.permitId,
+      requestId: second.permit.requestId,
+      operation: "google.sheets.range.read",
+      scope: second.permit.scope,
+      deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+    });
+    await engine.recordObservationOutcome({
+      permitId: second.permit.permitId,
+      requestId: second.permit.requestId,
+      status: "succeeded",
+      observedAt: new Date(now).toISOString(),
+      verificationStatus: "unverified",
+      evidenceRefs: ["outcome:second"],
+    });
+
+    const view = await engine.getOMSystemState();
+    expect(view.baseSnapshot).toMatchObject({
+      snapshotId: "GSS-2",
+      version: 2,
+      previousSnapshotId: "GSS-1",
+    });
+  });
+
+  it("rejects a previous state whose content no longer matches its hash", async () => {
+    const { permit } = await permitted();
+    await engine.consumeObservationPermit({
+      permitId: permit.permitId,
+      requestId: permit.requestId,
+      operation: "google.sheets.range.read",
+      scope: permit.scope,
+      deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+    });
+    await engine.recordObservationOutcome({
+      permitId: permit.permitId,
+      requestId: permit.requestId,
+      status: "failed",
+      observedAt: new Date(now).toISOString(),
+      verificationStatus: "unverified",
+      evidenceRefs: ["outcome:integrity-test"],
+      errorCode: "UPSTREAM_FAILURE",
+    });
+    const previous = structuredClone(
+      store.values.get("governance-state-previous") as StateSnapshot,
+    );
+    previous.components.R = 0.9;
+    store.values.set("governance-state-previous", previous);
+    await expect(engine.getOMSystemState()).rejects.toThrow(/previous state content hash mismatch/);
   });
 
   it("keeps mandatory gates and authority ceilings after successful evidence", async () => {

@@ -1,4 +1,5 @@
 export const STATE_KEYS = ["E", "K", "U", "R", "C", "D", "L", "A", "X"] as const;
+export const GOVERNANCE_ARTIFACT_REVISION = "om-p3-governed-sheets-system-state-v1" as const;
 export type StateKey = typeof STATE_KEYS[number];
 export type StateVector = Record<StateKey, number>;
 
@@ -31,8 +32,9 @@ export type GovernancePolicyFingerprintMaterial = Omit<
 >;
 
 export type DeploymentApprovalManifest = {
-  schemaVersion: "1.0";
+  schemaVersion: "1.1";
   approvalId: string;
+  artifactRevision: typeof GOVERNANCE_ARTIFACT_REVISION;
   policyHash: string;
   deploymentBindingFingerprint: string;
   accountId: string;
@@ -46,7 +48,7 @@ export type DeploymentApprovalManifest = {
 
 export type DeploymentApprovalExpectation = Pick<
   DeploymentApprovalManifest,
-  "approvalId" | "policyHash" | "deploymentBindingFingerprint" | "accountId" |
+  "approvalId" | "artifactRevision" | "policyHash" | "deploymentBindingFingerprint" | "accountId" |
   "runtimeWorkerName" | "adapterWorkerName" | "stage"
 >;
 
@@ -250,10 +252,87 @@ export type StateSnapshot = {
   contentHash: string;
 };
 
+export type StateRateVector = Record<StateKey, number | null>;
+
+export type OMSystemStateView = {
+  schemaVersion: "1.0";
+  subjectType: "system-self";
+  epistemicStatus: "estimated";
+  observedAt: string;
+  baseSnapshot: {
+    snapshotId: string;
+    version: number;
+    contentHash: string;
+    previousSnapshotId: string | null;
+  };
+  dynamics: {
+    current: StateVector;
+    rawDelta: StateRateVector;
+    ratePerDay: StateRateVector;
+    rateBasisSeconds: number | null;
+    rateAssessment: "insufficient-history" | "insufficient-basis" | "usable";
+    calibrated: false;
+    updateBasis: "policy-initialized-and-unverified-outcome-adjusted";
+    measurementConfidence: StateVector;
+  };
+  knowledgeState: {
+    evidenceQuality: number;
+    knowledgeIntegrity: number;
+    uncertainty: number;
+    unresolvedConflictIndex: number;
+  };
+  governanceState: {
+    risk: number;
+    uncertainty: number;
+    policyConflict: number;
+    policyDrift: number;
+    authorityCeilingId: string;
+    humanGate: "mandatory";
+    verificationIntensity: GovernanceEnvelope["verificationIntensity"];
+    modelRoutingRequirement: GovernanceEnvelope["modelRoutingRequirement"];
+  };
+  agentState: {
+    activityIndex: number;
+    configuredPrincipalId: string;
+    configuredCallerId: string;
+    activeAgentTelemetry: "not-observed";
+    modelSelfReportedConfidenceAccepted: false;
+  };
+  executionState: {
+    exposureIndex: number;
+    configuredOperation: string;
+    configuredService: string;
+    lifecycleTelemetry: "not-observed";
+  };
+  systemHealth: {
+    loadIndex: number;
+    driftIndex: number;
+    riskIndex: number;
+    minimumMeasurementConfidence: number;
+    errorRate: null;
+    cost: null;
+    processingLatencyMs: null;
+  };
+  evidence: {
+    refs: string[];
+    verificationStatus: "unverified";
+    sourceSnapshotHash: string;
+  };
+  controlBoundaries: {
+    authorityExpansionAllowed: false;
+    permissionExpansionAllowed: false;
+    scopeExpansionAllowed: false;
+    automaticGateRelaxationAllowed: false;
+    executionAuthorizationGenerated: false;
+  };
+  blindSpots: string[];
+};
+
 export interface GovernanceRuntimeBinding {
   prepareObservation(intent: ObservationIntentRequest): Promise<ObservationPreparation>;
   authorizeObservation(input: PermitAuthorizationRequest): Promise<ObservationPermit>;
   consumeObservationPermit(input: PermitConsumptionRequest): Promise<{ allowed: true; permitId: string }>;
   recordObservationOutcome(input: ObservationOutcome): Promise<StateSnapshot>;
   getStateSnapshot(): Promise<StateSnapshot>;
+  getOMSystemState(): Promise<OMSystemStateView>;
 }
