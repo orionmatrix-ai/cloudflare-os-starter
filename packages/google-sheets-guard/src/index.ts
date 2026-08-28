@@ -31,6 +31,8 @@ import type {
   SpreadsheetRange,
 } from "./types.js";
 import TYPES_CODE from "./types-code.js";
+import APPROVED_SPREADSHEET_CONFIGURATOR_HTML from
+  "./generated/approved-spreadsheet-configurator-ui.txt";
 import {
   normalizeConnectOptions,
   parseApprovedSpreadsheetUrl,
@@ -55,6 +57,9 @@ export {
 
 export { GoogleVerifier, UserAccount };
 export default googleWorker;
+
+@validateRpc()
+class ApprovedSpreadsheetConfiguratorUI extends RpcTarget {}
 
 const SHEETS_RESOURCE: SupportedResource = {
   urlPattern: SHEETS_RESOURCE_PATTERN,
@@ -165,10 +170,16 @@ export class GatekeeperUserImpl extends UpstreamUser implements GatekeeperUser {
     };
   }
 
-  startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
-    throw new Error(
-      "Resource search is disabled. Paste the exact deployment-approved Google Spreadsheet URL.",
-    );
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+  ): Promise<ResourceConfiguratorFrame> {
+    if (resourceUrlPattern !== SHEETS_RESOURCE_PATTERN) {
+      throw new Error("Only the deployment-approved Google Spreadsheet can be configured.");
+    }
+    return {
+      iframeHtml: APPROVED_SPREADSHEET_CONFIGURATOR_HTML,
+      ui: new RpcStub(new ApprovedSpreadsheetConfiguratorUI()),
+    };
   }
 
   async ensureResources(resourceUrlPatterns: string[]): Promise<{ url?: string }> {
