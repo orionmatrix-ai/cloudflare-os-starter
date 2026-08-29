@@ -75,6 +75,35 @@ function variant(mutate: (config: Record<string, any>) => void): DeploymentConfi
   return config as DeploymentConfig;
 }
 
+function enableP3Runtime(config: Record<string, any>): void {
+  config.googleSheetsGuard = { enabled: true };
+  config.governanceRuntime = {
+    enabled: true,
+    deploymentStage: "p3-evaluation",
+    approvalReference: "human-gate:p3-runtime-evaluation",
+    retentionApprovalReference: "human-gate:p3-retention-purge",
+    runtimeEnablementApproved: true,
+    policy: {
+      policyId: "om-p3-google-sheets-v1",
+      principalId: "principal:om-inc:p3-evaluator",
+      capabilityId: "capability:google-sheets:range-read",
+      authorityId: "authority:om-inc:p3-synthetic-read",
+      permissionId: "permission:om-inc:p3-fixed-range",
+      operation: "google.sheets.range.read",
+      service: "google-sheets",
+      dataClass: "synthetic",
+      preparationTtlSeconds: 120,
+      permitTtlSeconds: 30,
+      recordRetentionSeconds: 86_400,
+      mandatoryHumanGate: true,
+      initialState: { E: .8, K: .8, U: .2, R: .2, C: .1, D: .1, L: .2, A: .1, X: .2 },
+      initialMeasurementConfidence: {
+        E: .8, K: .8, U: .8, R: .8, C: .8, D: .8, L: .8, A: .8, X: .8,
+      },
+    },
+  };
+}
+
 // Read from disk rather than inlined, including the Error Reporter's: deploy.ts derives every
 // generated config from these files, so a copy here could drift from what actually ships.
 async function baseConfigs(): Promise<BaseConfigs> {
@@ -86,6 +115,7 @@ async function baseConfigs(): Promise<BaseConfigs> {
     customGatekeeper: await baseConfig("../packages/custom-gatekeeper/wrangler.jsonc"),
     googleSheetsGuard: await baseConfig("../packages/google-sheets-guard/wrangler.jsonc"),
     omGovernanceRuntime: await baseConfig("../packages/om-governance-runtime/wrangler.jsonc"),
+    systemStateVerifier: await baseConfig("../packages/system-state-verifier/wrangler.jsonc"),
     errorReporter: await baseConfig("../packages/error-reporter/wrangler.jsonc"),
   };
 }
@@ -333,43 +363,19 @@ test("keeps the P3 Google Sheets guard absent by default", async () => {
   const generated = generateConfigs(validConfig, await baseConfigs());
   assert.equal(generated.googleSheetsGuard, undefined);
   assert.equal(generated.omGovernanceRuntime, undefined);
+  assert.equal(generated.systemStateVerifier, undefined);
   assert.equal(generated.router.services!.some(
     (service) => service.binding === "GATEKEEPER_GOOGLE_SHEETS_GUARD"), false);
   assert.equal(generated.workshop.services!.some(
     (service) => service.binding === "GATEKEEPER_GOOGLE_SHEETS_GUARD"), false);
   assert.equal(buildCommands(validConfig).some(
     ({ args }) => args.includes("google-sheets-guard")), false);
+  assert.equal(buildCommands(validConfig).some(
+    ({ args }) => args.includes("system-state-verifier")), false);
 });
 
 test("generates a private, secret-bound P3 Google Sheets guard when enabled", async () => {
-  const config = variant((c) => {
-    c.googleSheetsGuard = { enabled: true };
-    c.governanceRuntime = {
-      enabled: true,
-      deploymentStage: "p3-evaluation",
-      approvalReference: "human-gate:p3-runtime-evaluation",
-      retentionApprovalReference: "human-gate:p3-retention-purge",
-      runtimeEnablementApproved: true,
-      policy: {
-        policyId: "om-p3-google-sheets-v1",
-        principalId: "principal:om-inc:p3-evaluator",
-        capabilityId: "capability:google-sheets:range-read",
-        authorityId: "authority:om-inc:p3-synthetic-read",
-        permissionId: "permission:om-inc:p3-fixed-range",
-        operation: "google.sheets.range.read",
-        service: "google-sheets",
-        dataClass: "synthetic",
-        preparationTtlSeconds: 120,
-        permitTtlSeconds: 30,
-        recordRetentionSeconds: 86_400,
-        mandatoryHumanGate: true,
-        initialState: { E: .8, K: .8, U: .2, R: .2, C: .1, D: .1, L: .2, A: .1, X: .2 },
-        initialMeasurementConfidence: {
-          E: .8, K: .8, U: .8, R: .8, C: .8, D: .8, L: .8, A: .8, X: .8,
-        },
-      },
-    };
-  });
+  const config = variant(enableP3Runtime);
   const generated = generateConfigs(config, await baseConfigs());
   const guard = generated.googleSheetsGuard!;
   const governance = generated.omGovernanceRuntime!;
@@ -434,6 +440,134 @@ test("generates a private, secret-bound P3 Google Sheets guard when enabled", as
     ({ args }) => args.includes("om-governance-runtime")));
   assert.ok(buildCommands(config).some(({ args }) =>
     args.includes("@gadgets/google-gatekeeper") && args.at(-1) === "build:configurator"));
+});
+
+test("generates a private read-only System State Verifier with a separate approval", async () => {
+  const config = variant((c) => {
+    enableP3Runtime(c);
+    c.workers.systemStateVerifier = { name: "acme-cloudflare-os-state-verifier" };
+    c.systemStateVerifier = {
+      enabled: true,
+      approvalReference: "human-gate:p3-system-state-verifier",
+      freshnessSeconds: 86_400,
+      verifierEnablementApproved: true,
+    };
+  });
+  const generated = generateConfigs(config, await baseConfigs());
+  const verifier = generated.systemStateVerifier!;
+  const governance = generated.omGovernanceRuntime!;
+  if (!config.governanceRuntime?.enabled) throw new Error("test fixture must enable Governance Runtime");
+  const expectedPolicyHash = governancePolicyHash({
+    ...config.governanceRuntime.policy,
+    deploymentApprovalReference: config.governanceRuntime.approvalReference,
+    trustedCallerId: "google-sheets-guard",
+  });
+
+  assert.equal(verifier.name, "acme-cloudflare-os-state-verifier");
+  assert.equal(verifier.workers_dev, false);
+  assert.equal(verifier.preview_urls, false);
+  assert.equal(verifier.routes, undefined);
+  assert.deepEqual(verifier.secrets, {
+    required: ["OM_GOVERNANCE_VERIFIER_APPROVAL"],
+  });
+  assert.deepEqual(verifier.services, [{
+    binding: "OM_STATE_READ",
+    service: "acme-cloudflare-os-governance",
+    entrypoint: "GovernanceStateReadService",
+    props: { callerId: "system-state-verifier" },
+  }]);
+  assert.equal(verifier.services!.some(
+    (service) => service.entrypoint === "GovernanceRuntimeService"), false);
+  assert.deepEqual(verifier.vars, {
+    OM_STATE_VERIFIER_FRESHNESS_SECONDS: "86400",
+    OM_STATE_VERIFIER_APPROVAL_ID: "human-gate:p3-system-state-verifier",
+    OM_STATE_VERIFIER_ARTIFACT_REVISION:
+      "om-p3-governed-sheets-system-state-verifier-v1",
+    OM_STATE_VERIFIER_POLICY_HASH: expectedPolicyHash,
+    OM_STATE_VERIFIER_ACCOUNT_ID: config.accountId,
+    OM_STATE_VERIFIER_RUNTIME_WORKER: "acme-cloudflare-os-governance",
+    OM_STATE_VERIFIER_WORKER: "acme-cloudflare-os-state-verifier",
+    OM_STATE_VERIFIER_ROUTER_WORKER: "acme-cloudflare-os",
+    OM_STATE_VERIFIER_STAGE: "p3-evaluation",
+    OM_STATE_VERIFIER_CALLER_ID: "system-state-verifier",
+  });
+  assert.ok(generated.router.services!.some((service) =>
+    service.binding === "GATEKEEPER_SYSTEM_STATE_VERIFIER" &&
+    service.service === "acme-cloudflare-os-state-verifier" &&
+    service.entrypoint === undefined));
+  assert.ok(generated.workshop.services!.some((service) =>
+    service.binding === "GATEKEEPER_SYSTEM_STATE_VERIFIER" &&
+    service.service === "acme-cloudflare-os-state-verifier" &&
+    service.entrypoint === "GatekeeperVendor"));
+  assert.equal(
+    governance.vars!.OM_GOVERNANCE_VERIFIER_APPROVAL_ID,
+    "human-gate:p3-system-state-verifier",
+  );
+  assert.equal(
+    governance.vars!.OM_GOVERNANCE_VERIFIER_WORKER,
+    "acme-cloudflare-os-state-verifier",
+  );
+  assert.ok(governance.secrets!.required.includes("OM_GOVERNANCE_VERIFIER_APPROVAL"));
+  assert.ok(buildCommands(config).some(
+    ({ args }) => args.includes("system-state-verifier")));
+});
+
+test("rejects unsafe or incomplete System State Verifier enablement", () => {
+  assert.throws(() => validateConfig(variant((c) => {
+    c.systemStateVerifier = {
+      enabled: true,
+      approvalReference: "human-gate:p3-system-state-verifier",
+      freshnessSeconds: 86_400,
+      verifierEnablementApproved: true,
+    };
+    c.workers.systemStateVerifier = { name: "acme-state-verifier" };
+  })), /requires governanceRuntime.enabled/);
+
+  for (const freshnessSeconds of [59, 86_401, 1.5]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableP3Runtime(c);
+      c.workers.systemStateVerifier = { name: "acme-state-verifier" };
+      c.systemStateVerifier = {
+        enabled: true,
+        approvalReference: "human-gate:p3-system-state-verifier",
+        freshnessSeconds,
+        verifierEnablementApproved: true,
+      };
+    })), /freshnessSeconds must be 60\.\.86400/);
+  }
+
+  assert.throws(() => validateConfig(variant((c) => {
+    enableP3Runtime(c);
+    c.workers.systemStateVerifier = { name: "acme-state-verifier" };
+    c.systemStateVerifier = {
+      enabled: true,
+      approvalReference: "human-gate:p3-system-state-verifier",
+      freshnessSeconds: 86_400,
+      verifierEnablementApproved: false,
+    };
+  })), /verifierEnablementApproved must be true/);
+
+  assert.throws(() => validateConfig(variant((c) => {
+    enableP3Runtime(c);
+    c.systemStateVerifier = {
+      enabled: true,
+      approvalReference: "human-gate:p3-system-state-verifier",
+      freshnessSeconds: 86_400,
+      verifierEnablementApproved: true,
+    };
+  })), /workers.systemStateVerifier.name/);
+
+  assert.throws(() => validateConfig(variant((c) => {
+    enableP3Runtime(c);
+    c.workers.systemStateVerifier = { name: "acme-state-verifier" };
+    c.systemStateVerifier = {
+      enabled: true,
+      approvalReference: "human-gate:p3-system-state-verifier",
+      freshnessSeconds: 86_400,
+      verifierEnablementApproved: true,
+      executionApprovalReference: "must-not-be-accepted",
+    };
+  })), /unknown or missing fields/);
 });
 
 test("requires a P3 guard Worker name only when the guard is enabled", () => {

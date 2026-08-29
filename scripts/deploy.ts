@@ -8,6 +8,8 @@ import { parse, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { pnpmCommand } from "../cloudflare-os/scripts/pnpm-command.ts";
 import { resolveBinEntry } from "../cloudflare-os/scripts/bin-entry.ts";
 import { AI_GATEWAY_PROVIDERS } from "./deployment-config.ts";
+import { GOVERNANCE_ARTIFACT_REVISION } from
+  "../packages/om-governance-runtime/src/contracts.ts";
 import type {
   BaseConfigs,
   BuildCommand,
@@ -28,6 +30,7 @@ const packageDirs = {
   customGatekeeper: "packages/custom-gatekeeper",
   googleSheetsGuard: "packages/google-sheets-guard",
   omGovernanceRuntime: "packages/om-governance-runtime",
+  systemStateVerifier: "packages/system-state-verifier",
   errorReporter: "packages/error-reporter",
 } as const;
 const generatedPaths = Object.fromEntries(
@@ -90,6 +93,10 @@ const googleSheetsGuardPaths = [
 
 const governanceRuntimePaths = [
   "workers.omGovernanceRuntime.name",
+];
+
+const systemStateVerifierPaths = [
+  "workers.systemStateVerifier.name",
 ];
 
 const resourcePaths = [
@@ -199,6 +206,12 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
        Array.isArray(governanceRuntime) || typeof governanceRuntime.enabled !== "boolean")) {
     throw new Error("Governance Runtime configuration must be an object with boolean enabled.");
   }
+  const systemStateVerifier = config.systemStateVerifier;
+  if (systemStateVerifier !== undefined &&
+      (systemStateVerifier === null || typeof systemStateVerifier !== "object" ||
+       Array.isArray(systemStateVerifier) || typeof systemStateVerifier.enabled !== "boolean")) {
+    throw new Error("System State Verifier configuration must be an object with boolean enabled.");
+  }
   if (config.googleSheetsGuard?.enabled && !governanceRuntime?.enabled) {
     throw new Error(
       "googleSheetsGuard.enabled requires governanceRuntime.enabled; no ungoverned fallback is permitted.");
@@ -206,6 +219,31 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
   if (governanceRuntime?.enabled && !config.googleSheetsGuard?.enabled) {
     throw new Error(
       "governanceRuntime.enabled requires googleSheetsGuard.enabled in the current P3 adapter deployment.");
+  }
+  if (systemStateVerifier?.enabled && !governanceRuntime?.enabled) {
+    throw new Error(
+      "systemStateVerifier.enabled requires governanceRuntime.enabled; no fallback is permitted.");
+  }
+  if (systemStateVerifier?.enabled) {
+    const verifierKeys = [
+      "enabled", "approvalReference", "freshnessSeconds", "verifierEnablementApproved",
+    ].toSorted();
+    if (JSON.stringify(Object.keys(systemStateVerifier).toSorted()) !== JSON.stringify(verifierKeys)) {
+      throw new Error("systemStateVerifier has unknown or missing fields.");
+    }
+    if (typeof systemStateVerifier.approvalReference !== "string" ||
+        !systemStateVerifier.approvalReference.trim()) {
+      throw new Error("systemStateVerifier.approvalReference must identify the verifier Human Gate.");
+    }
+    if (!Number.isSafeInteger(systemStateVerifier.freshnessSeconds) ||
+        systemStateVerifier.freshnessSeconds < 60 ||
+        systemStateVerifier.freshnessSeconds > 86_400) {
+      throw new Error("systemStateVerifier.freshnessSeconds must be 60..86400.");
+    }
+    if (systemStateVerifier.verifierEnablementApproved !== true) {
+      throw new Error(
+        "systemStateVerifier.verifierEnablementApproved must be true before deployment.");
+    }
   }
   if (governanceRuntime?.enabled) {
     const runtimeKeys = [
@@ -289,6 +327,7 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
     ...(config.errorReporting?.enabled ? errorReportingPaths : []),
     ...(config.googleSheetsGuard?.enabled ? googleSheetsGuardPaths : []),
     ...(config.governanceRuntime?.enabled ? governanceRuntimePaths : []),
+    ...(config.systemStateVerifier?.enabled ? systemStateVerifierPaths : []),
   ];
   for (const path of activePaths) {
     const value = valueAt(config, path);
@@ -341,7 +380,8 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
     .filter(([key, worker]) => worker !== undefined &&
       (key !== "errorReporter" || config.errorReporting.enabled) &&
       (key !== "googleSheetsGuard" || config.googleSheetsGuard?.enabled) &&
-      (key !== "omGovernanceRuntime" || config.governanceRuntime?.enabled))
+      (key !== "omGovernanceRuntime" || config.governanceRuntime?.enabled) &&
+      (key !== "systemStateVerifier" || config.systemStateVerifier?.enabled))
     .map(([, worker]) => worker!.name);
   if (new Set(workerNames).size !== workerNames.length) {
     throw new Error(
@@ -561,6 +601,9 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   const activeGovernanceRuntime = config.governanceRuntime?.enabled
     ? config.governanceRuntime
     : undefined;
+  const activeSystemStateVerifier = config.systemStateVerifier?.enabled
+    ? config.systemStateVerifier
+    : undefined;
   const activeGovernancePolicy = activeGovernanceRuntime
     ? (() => {
         const policyInput = {
@@ -582,6 +625,9 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   const omGovernanceRuntime = config.governanceRuntime?.enabled
     ? structuredClone(bases.omGovernanceRuntime)
     : undefined;
+  const systemStateVerifier = config.systemStateVerifier?.enabled
+    ? structuredClone(bases.systemStateVerifier)
+    : undefined;
   const errorReporter = config.errorReporting.enabled
     ? structuredClone(bases.errorReporter)
     : undefined;
@@ -598,6 +644,10 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     ...(googleSheetsGuard ? [{
       binding: "GATEKEEPER_GOOGLE_SHEETS_GUARD",
       service: config.workers.googleSheetsGuard!.name,
+    }] : []),
+    ...(systemStateVerifier ? [{
+      binding: "GATEKEEPER_SYSTEM_STATE_VERIFIER",
+      service: config.workers.systemStateVerifier!.name,
     }] : []),
   ];
 
@@ -667,6 +717,11 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     ...(googleSheetsGuard ? [{
       binding: "GATEKEEPER_GOOGLE_SHEETS_GUARD",
       service: config.workers.googleSheetsGuard!.name,
+      entrypoint: "GatekeeperVendor",
+    }] : []),
+    ...(systemStateVerifier ? [{
+      binding: "GATEKEEPER_SYSTEM_STATE_VERIFIER",
+      service: config.workers.systemStateVerifier!.name,
       entrypoint: "GatekeeperVendor",
     }] : []),
   ];
@@ -751,6 +806,12 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
       OM_GOVERNANCE_STAGE: activeGovernanceRuntime.deploymentStage,
       OM_GOVERNANCE_RETENTION_APPROVAL_ID:
         activeGovernanceRuntime.retentionApprovalReference,
+      ...(activeSystemStateVerifier ? {
+        OM_GOVERNANCE_VERIFIER_APPROVAL_ID: activeSystemStateVerifier.approvalReference,
+        OM_GOVERNANCE_VERIFIER_WORKER: config.workers.systemStateVerifier!.name,
+        OM_GOVERNANCE_ROUTER_WORKER: config.workers.router.name,
+        OM_GOVERNANCE_VERIFIER_CALLER_ID: "system-state-verifier",
+      } : {}),
     };
     omGovernanceRuntime.secrets = {
       required: [
@@ -758,8 +819,38 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
         "P3_ALLOWED_RANGE",
         "OM_GOVERNANCE_DEPLOYMENT_APPROVAL",
         "OM_GOVERNANCE_RETENTION_CONTROL",
+        ...(activeSystemStateVerifier ? ["OM_GOVERNANCE_VERIFIER_APPROVAL"] : []),
       ],
     };
+  }
+
+  if (systemStateVerifier) {
+    if (!activeGovernanceRuntime || !activeGovernancePolicy || !activeSystemStateVerifier) {
+      throw new Error("enabled System State Verifier requires Governance Runtime and policy.");
+    }
+    setCommon(systemStateVerifier, config, config.workers.systemStateVerifier!.name);
+    systemStateVerifier.vars = {
+      OM_STATE_VERIFIER_FRESHNESS_SECONDS: String(activeSystemStateVerifier.freshnessSeconds),
+      OM_STATE_VERIFIER_APPROVAL_ID: activeSystemStateVerifier.approvalReference,
+      OM_STATE_VERIFIER_ARTIFACT_REVISION: GOVERNANCE_ARTIFACT_REVISION,
+      OM_STATE_VERIFIER_POLICY_HASH: activeGovernancePolicy.policyHash,
+      OM_STATE_VERIFIER_ACCOUNT_ID: config.accountId,
+      OM_STATE_VERIFIER_RUNTIME_WORKER: config.workers.omGovernanceRuntime!.name,
+      OM_STATE_VERIFIER_WORKER: config.workers.systemStateVerifier!.name,
+      OM_STATE_VERIFIER_ROUTER_WORKER: config.workers.router.name,
+      OM_STATE_VERIFIER_STAGE: activeGovernanceRuntime.deploymentStage,
+      OM_STATE_VERIFIER_CALLER_ID: "system-state-verifier",
+    };
+    systemStateVerifier.services = [
+      ...(systemStateVerifier.services ?? []),
+      {
+        binding: "OM_STATE_READ",
+        service: config.workers.omGovernanceRuntime!.name,
+        entrypoint: "GovernanceStateReadService",
+        props: { callerId: "system-state-verifier" },
+      },
+    ];
+    systemStateVerifier.secrets = { required: ["OM_GOVERNANCE_VERIFIER_APPROVAL"] };
   }
 
   if (errorReporter) {
@@ -770,6 +861,7 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     router, workshop, context, scheduler, customGatekeeper,
     ...(googleSheetsGuard && { googleSheetsGuard }),
     ...(omGovernanceRuntime && { omGovernanceRuntime }),
+    ...(systemStateVerifier && { systemStateVerifier }),
     ...(errorReporter && { errorReporter }),
   };
 }
@@ -818,6 +910,9 @@ export function buildCommands(config: DeploymentConfig): BuildCommand[] {
     { args: submoduleBuild("@gadgets/gatekeeper-scheduler") },
     { args: ownBuild("custom-gatekeeper") },
     ...(config.governanceRuntime?.enabled ? [{ args: ownBuild("om-governance-runtime") }] : []),
+    ...(config.systemStateVerifier?.enabled
+      ? [{ args: ownBuild("system-state-verifier") }]
+      : []),
     ...(config.googleSheetsGuard?.enabled ? [
       // The wrapper inherits the pinned Google worker. Its imported module references generated
       // configurator assets even though this facade never exposes the picker, so build them from
@@ -942,6 +1037,8 @@ async function main(): Promise<void> {
     customGatekeeper: await readJsonc(join(root, packageDirs.customGatekeeper, "wrangler.jsonc")),
     googleSheetsGuard: await readJsonc(join(root, packageDirs.googleSheetsGuard, "wrangler.jsonc")),
     omGovernanceRuntime: await readJsonc(join(root, packageDirs.omGovernanceRuntime, "wrangler.jsonc")),
+    systemStateVerifier: await readJsonc(
+      join(root, packageDirs.systemStateVerifier, "wrangler.jsonc")),
     errorReporter: await readJsonc(join(root, packageDirs.errorReporter, "wrangler.jsonc")),
   });
   reportAiGateway(config);
@@ -964,6 +1061,9 @@ async function main(): Promise<void> {
     deployWorker(packageDirs.customGatekeeper, deployArgs);
     if (config.governanceRuntime?.enabled) {
       deployWorker(packageDirs.omGovernanceRuntime, deployArgs);
+    }
+    if (config.systemStateVerifier?.enabled) {
+      deployWorker(packageDirs.systemStateVerifier, deployArgs);
     }
     if (config.googleSheetsGuard?.enabled) {
       deployWorker(packageDirs.googleSheetsGuard, deployArgs);

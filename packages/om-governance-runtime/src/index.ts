@@ -1,17 +1,20 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import type {
   GovernanceRuntimeBinding,
+  GovernanceStateReadBinding,
   GovernancePolicy,
   AttestedPermitAuthorization,
   ObservationIntent,
   ObservationIntentRequest,
   ObservationOutcome,
   OMSystemStateView,
+  OMSystemStateVerificationBundle,
   PermitAuthorizationRequest,
   PermitConsumption,
   PermitConsumptionRequest,
   PurgeResult,
   StateSnapshot,
+  StateVerificationRequest,
 } from "./contracts.js";
 import { GOVERNANCE_ARTIFACT_REVISION } from "./contracts.js";
 import {
@@ -20,6 +23,7 @@ import {
   parseDeploymentApproval,
   parsePolicyTemplate,
   parseRetentionControl,
+  parseVerifierApproval,
   type GovernanceStore,
   type GovernanceTransactionStore,
 } from "./core.js";
@@ -37,6 +41,11 @@ interface GovernanceEnv {
   OM_GOVERNANCE_ADAPTER_WORKER: string;
   OM_GOVERNANCE_STAGE: string;
   OM_GOVERNANCE_RETENTION_APPROVAL_ID: string;
+  OM_GOVERNANCE_VERIFIER_APPROVAL?: string;
+  OM_GOVERNANCE_VERIFIER_APPROVAL_ID: string;
+  OM_GOVERNANCE_VERIFIER_WORKER: string;
+  OM_GOVERNANCE_ROUTER_WORKER: string;
+  OM_GOVERNANCE_VERIFIER_CALLER_ID: string;
   P3_SPREADSHEET_ID?: string;
   P3_ALLOWED_RANGE?: string;
 }
@@ -124,6 +133,12 @@ export class GovernanceRuntimeState extends DurableObject<GovernanceEnv> {
 
   getOMSystemState(): Promise<OMSystemStateView> {
     return this.state.blockConcurrencyWhile(() => this.engine.getOMSystemState());
+  }
+
+  getVerificationBundle(
+    input: StateVerificationRequest,
+  ): Promise<OMSystemStateVerificationBundle> {
+    return this.state.blockConcurrencyWhile(() => this.engine.getVerificationBundle(input));
   }
 
   alarm(): Promise<void> {
@@ -235,6 +250,61 @@ export class GovernanceRuntimeService extends WorkerEntrypoint<GovernanceEnv, Go
   async getOMSystemState(): Promise<OMSystemStateView> {
     this.assertCaller();
     return (await this.runtime()).getOMSystemState();
+  }
+}
+
+/**
+ * Narrow read-only entrypoint for the structurally separate verifier Worker.
+ * Do not add observation, permit, outcome, retention, or state mutation methods here.
+ */
+export class GovernanceStateReadService extends WorkerEntrypoint<GovernanceEnv, GovernanceBindingProps>
+    implements GovernanceStateReadBinding {
+  private bindingFingerprint?: Promise<string>;
+  private parsedPolicy?: GovernancePolicy;
+
+  private policy(): GovernancePolicy {
+    this.parsedPolicy ??= parsePolicyTemplate(
+      this.env.OM_GOVERNANCE_POLICY,
+      this.env.P3_SPREADSHEET_ID,
+      this.env.P3_ALLOWED_RANGE,
+    );
+    return this.parsedPolicy;
+  }
+
+  private assertCaller(): void {
+    if (this.ctx.props.callerId !== this.env.OM_GOVERNANCE_VERIFIER_CALLER_ID) {
+      throw new Error("Governance State read caller is not trusted.");
+    }
+  }
+
+  private currentBindingFingerprint(): Promise<string> {
+    this.bindingFingerprint ??= deploymentBindingFingerprint(this.policy());
+    return this.bindingFingerprint;
+  }
+
+  private async runtime(): Promise<DurableObjectStub<GovernanceRuntimeState>> {
+    const fingerprint = await this.currentBindingFingerprint();
+    const policy = this.policy();
+    parseVerifierApproval(this.env.OM_GOVERNANCE_VERIFIER_APPROVAL, {
+      approvalId: this.env.OM_GOVERNANCE_VERIFIER_APPROVAL_ID,
+      artifactRevision: GOVERNANCE_ARTIFACT_REVISION,
+      policyHash: policy.policyHash,
+      deploymentBindingFingerprint: fingerprint,
+      accountId: this.env.OM_GOVERNANCE_ACCOUNT_ID,
+      runtimeWorkerName: this.env.OM_GOVERNANCE_RUNTIME_WORKER,
+      verifierWorkerName: this.env.OM_GOVERNANCE_VERIFIER_WORKER,
+      routerWorkerName: this.env.OM_GOVERNANCE_ROUTER_WORKER,
+      stage: this.env.OM_GOVERNANCE_STAGE,
+      callerId: this.env.OM_GOVERNANCE_VERIFIER_CALLER_ID,
+    });
+    return this.env.GOVERNANCE_STATE.getByName(`om-inc:${fingerprint}`);
+  }
+
+  async getVerificationBundle(
+    input: StateVerificationRequest,
+  ): Promise<OMSystemStateVerificationBundle> {
+    this.assertCaller();
+    return (await this.runtime()).getVerificationBundle(input);
   }
 }
 

@@ -48,7 +48,8 @@ self-reported model belief. The view combines:
 The view never grants Authority, Permission, scope, gate relaxation, or Execution Authorization.
 Unobserved active-agent details, execution lifecycle counts, error rate, cost, and latency remain
 `not-observed` or `null`; the Runtime does not infer them from missing telemetry. Observation outcomes
-remain `unverified` until a separate verifier ingestion path exists.
+remain `unverified`: the System State Verifier checks state integrity and derived projections, not
+the truth of an external Google result.
 
 The view labels the estimator `calibrated: false` and identifies its update basis as policy-initialized
 state with conservative adjustments from unverified outcomes. Current and previous Snapshot content
@@ -74,6 +75,26 @@ The manifest also binds `artifactRevision` to the Runtime's compiled-in
 `GOVERNANCE_ARTIFACT_REVISION`. Any code release that changes this revision fails closed against an
 older deployment approval secret. A fresh artifact-bound Human Gate and secret update are required
 before that release can be deployed; an older approval reference cannot authorize changed code.
+
+## Independent verifier entrypoint
+
+`GovernanceStateReadService` is a second, deliberately narrow service-binding entrypoint. It exposes
+only `getVerificationBundle()` and cannot prepare observations, authorize or consume permits, record
+outcomes, purge retention data, or initialize missing state. The read fails closed when the current
+state does not already exist.
+
+The entrypoint requires a separate `OM_GOVERNANCE_VERIFIER_APPROVAL` secret. Its manifest binds the
+approved artifact revision, policy and exact-resource deployment fingerprints, account, Runtime,
+Verifier and Router Worker identities, deployment stage, caller binding ID, validity window, and
+revocation state. This is independent from `OM_GOVERNANCE_DEPLOYMENT_APPROVAL`; approval to deploy or
+execute the observation path does not approve state verification, and vice versa.
+
+The private bundle contains current and immediate-previous snapshots, the System State view, and
+policy fingerprint material that excludes the exact resource ID and range. The Verifier independently
+recomputes snapshot hashes, policy hash, state rates, risk envelope, verification intensity, model
+routing, and control-boundary closure. The read itself writes nothing. Snapshot schema v1 does not
+cryptographically bind current content to previous content, so the verifier reports only immediate
+version/ID/time adjacency and explicitly discloses that limitation.
 
 Cloudflare `ApprovalQueue` currently returns no opaque signed approval record. The private service
 binding therefore stamps a trusted connector attestation after the queue call returns. This is a

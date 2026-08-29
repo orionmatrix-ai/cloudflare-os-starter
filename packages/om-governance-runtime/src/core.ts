@@ -7,6 +7,8 @@ import {
   type PurgeResult,
   type RetentionControlExpectation,
   type RetentionControlManifest,
+  type VerifierApprovalExpectation,
+  type VerifierApprovalManifest,
   type GovernanceEnvelope,
   type GovernancePolicy,
   type GovernancePolicyFingerprintMaterial,
@@ -19,8 +21,10 @@ import {
   type ObservationPreparation,
   type ObservationScope,
   type OMSystemStateView,
+  type OMSystemStateVerificationBundle,
   type PermitConsumption,
   type StateSnapshot,
+  type StateVerificationRequest,
   type StateRateVector,
   type StateVector,
 } from "./contracts.js";
@@ -372,6 +376,40 @@ export function parseDeploymentApproval(
   return value as DeploymentApprovalManifest;
 }
 
+export function parseVerifierApproval(
+  raw: string | undefined,
+  expected: VerifierApprovalExpectation,
+  now = Date.now(),
+): VerifierApprovalManifest {
+  nonempty(raw, "OM_GOVERNANCE_VERIFIER_APPROVAL");
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("OM_GOVERNANCE_VERIFIER_APPROVAL must be valid JSON.");
+  }
+  assert(isObject(value), "OM_GOVERNANCE_VERIFIER_APPROVAL must be an object.");
+  exactKeys(value, [
+    "schemaVersion", "approvalId", "artifactRevision", "policyHash",
+    "deploymentBindingFingerprint", "accountId", "runtimeWorkerName", "verifierWorkerName",
+    "routerWorkerName", "stage", "callerId", "approvedAt", "expiresAt", "revoked",
+  ], "OM_GOVERNANCE_VERIFIER_APPROVAL");
+  assert(value.schemaVersion === "1.0", "verifier approval schemaVersion is unsupported.");
+  for (const key of [
+    "approvalId", "artifactRevision", "policyHash", "deploymentBindingFingerprint", "accountId",
+    "runtimeWorkerName", "verifierWorkerName", "routerWorkerName", "stage", "callerId",
+  ] as const) nonempty(value[key], `verifier approval.${key}`);
+  const approvedAt = timestamp(value.approvedAt, "verifier approval.approvedAt");
+  const expiresAt = timestamp(value.expiresAt, "verifier approval.expiresAt");
+  assert(approvedAt <= now + 5_000, "verifier approval is in the future.");
+  assert(expiresAt >= now && expiresAt > approvedAt, "verifier approval validity window is invalid.");
+  assert(value.revoked === false, "verifier approval is revoked.");
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    assert(value[key] === expectedValue, `verifier approval ${key} binding mismatch.`);
+  }
+  return value as VerifierApprovalManifest;
+}
+
 export function parseRetentionControl(
   raw: string | undefined,
   expected: RetentionControlExpectation,
@@ -472,7 +510,7 @@ function rounded(value: number): number {
 
 export function deriveStateRate(
   current: StateSnapshot,
-  previous?: StateSnapshot,
+  previous?: StateSnapshot | null,
 ): {
   rawDelta: StateRateVector;
   ratePerDay: StateRateVector;
@@ -640,9 +678,7 @@ export class GovernanceEngine {
     return created;
   }
 
-  async getOMSystemState(): Promise<OMSystemStateView> {
-    const current = await this.getStateSnapshot();
-    await assertSnapshotIntegrity(current, "current state");
+  private async validatedPrevious(current: StateSnapshot): Promise<StateSnapshot | null> {
     const previous = await this.store.get<StateSnapshot>(PREVIOUS_STATE_KEY);
     if (previous) {
       await assertSnapshotIntegrity(previous, "previous state");
@@ -653,6 +689,13 @@ export class GovernanceEngine {
       assert(previous.version === current.version - 1,
         "previous state is not the immediate predecessor.");
     }
+    return previous ?? null;
+  }
+
+  private buildOMSystemStateView(
+    current: StateSnapshot,
+    previous: StateSnapshot | null,
+  ): OMSystemStateView {
     const envelope = deriveEnvelope(current, this.policy);
     const rate = deriveStateRate(current, previous);
     const { E, K, U, R, C, D, L, A, X } = current.components;
@@ -733,6 +776,46 @@ export class GovernanceEngine {
         "error rate, cost, and processing latency telemetry are not yet ingested",
         "outcomes remain unverified until a separate verifier ingestion path is implemented",
       ],
+    };
+  }
+
+  async getOMSystemState(): Promise<OMSystemStateView> {
+    const current = await this.getStateSnapshot();
+    await assertSnapshotIntegrity(current, "current state");
+    const previous = await this.validatedPrevious(current);
+    return this.buildOMSystemStateView(current, previous);
+  }
+
+  async getVerificationBundle(
+    input: StateVerificationRequest,
+  ): Promise<OMSystemStateVerificationBundle> {
+    assert(isObject(input), "state verification request must be an object.");
+    exactKeys(input, ["requestId", "requestedAt"], "state verification request");
+    nonempty(input.requestId, "state verification request.requestId");
+    const now = this.now();
+    const requestedAt = timestamp(input.requestedAt, "state verification request.requestedAt");
+    assert(requestedAt <= now + 5_000 && requestedAt >= now - 300_000,
+      "state verification request is outside the freshness window.");
+    await this.ensurePolicyIntegrity();
+    const bindingFingerprint = await this.currentDeploymentBindingFingerprint();
+    const current = await this.store.get<StateSnapshot>(STATE_KEY);
+    assert(current, "governance state is not initialized; verification cannot create it.");
+    assert(current.policyHash === this.policy.policyHash,
+      "stored state policy binding mismatch.");
+    assert(current.deploymentBindingFingerprint === bindingFingerprint,
+      "stored state deployment binding mismatch.");
+    await assertSnapshotIntegrity(current, "current state");
+    const previous = await this.validatedPrevious(current);
+    return {
+      schemaVersion: "1.0",
+      generatedAt: new Date(now).toISOString(),
+      requestId: input.requestId,
+      policyHash: this.policy.policyHash,
+      policy: structuredClone(policyFingerprintMaterial(this.policy)),
+      deploymentBindingFingerprint: bindingFingerprint,
+      current: structuredClone(current),
+      previous: previous ? structuredClone(previous) : null,
+      stateView: this.buildOMSystemStateView(current, previous),
     };
   }
 
