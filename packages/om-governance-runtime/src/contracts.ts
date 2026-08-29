@@ -1,5 +1,6 @@
 export const STATE_KEYS = ["E", "K", "U", "R", "C", "D", "L", "A", "X"] as const;
-export const GOVERNANCE_ARTIFACT_REVISION = "om-p3-governed-sheets-system-state-v1" as const;
+export const GOVERNANCE_ARTIFACT_REVISION =
+  "om-p3-governed-sheets-system-state-verifier-v1" as const;
 export type StateKey = typeof STATE_KEYS[number];
 export type StateVector = Record<StateKey, number>;
 
@@ -50,6 +51,30 @@ export type DeploymentApprovalExpectation = Pick<
   DeploymentApprovalManifest,
   "approvalId" | "artifactRevision" | "policyHash" | "deploymentBindingFingerprint" | "accountId" |
   "runtimeWorkerName" | "adapterWorkerName" | "stage"
+>;
+
+export type VerifierApprovalManifest = {
+  schemaVersion: "1.0";
+  approvalId: string;
+  artifactRevision: typeof GOVERNANCE_ARTIFACT_REVISION;
+  policyHash: string;
+  deploymentBindingFingerprint: string;
+  accountId: string;
+  runtimeWorkerName: string;
+  verifierWorkerName: string;
+  routerWorkerName: string;
+  stage: string;
+  callerId: string;
+  approvedAt: string;
+  expiresAt: string;
+  revoked: false;
+};
+
+export type VerifierApprovalExpectation = Pick<
+  VerifierApprovalManifest,
+  "approvalId" | "artifactRevision" | "policyHash" | "deploymentBindingFingerprint" |
+  "accountId" | "runtimeWorkerName" | "verifierWorkerName" | "routerWorkerName" | "stage" |
+  "callerId"
 >;
 
 export type RetentionControlManifest = {
@@ -327,6 +352,28 @@ export type OMSystemStateView = {
   };
   blindSpots: string[];
 };
+
+export type StateVerificationRequest = {
+  requestId: string;
+  requestedAt: string;
+};
+
+export type OMSystemStateVerificationBundle = {
+  schemaVersion: "1.0";
+  generatedAt: string;
+  requestId: string;
+  policyHash: string;
+  policy: GovernancePolicyFingerprintMaterial;
+  deploymentBindingFingerprint: string;
+  current: StateSnapshot;
+  previous: StateSnapshot | null;
+  stateView: OMSystemStateView;
+};
+
+/** Read-only capability intentionally separated from GovernanceRuntimeBinding's mutating methods. */
+export interface GovernanceStateReadBinding {
+  getVerificationBundle(input: StateVerificationRequest): Promise<OMSystemStateVerificationBundle>;
+}
 
 export interface GovernanceRuntimeBinding {
   prepareObservation(intent: ObservationIntentRequest): Promise<ObservationPreparation>;

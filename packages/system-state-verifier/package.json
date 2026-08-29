@@ -1,0 +1,26 @@
+{
+  "name": "system-state-verifier",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "types:check": "tsc --noEmit",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "@gadgets/workshop-shared": "workspace:*",
+    "capnweb": "catalog:",
+    "capnweb-validate": "catalog:",
+    "om-governance-runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
+    "@cloudflare/workers-types": "5.20260818.1",
+    "@types/node": "26.1.0",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

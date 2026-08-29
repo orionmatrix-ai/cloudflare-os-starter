@@ -5,6 +5,7 @@ import type {
   RetentionControlManifest,
   StateSnapshot,
   StateVector,
+  VerifierApprovalManifest,
 } from "../src/contracts.js";
 import { GOVERNANCE_ARTIFACT_REVISION } from "../src/contracts.js";
 import {
@@ -17,6 +18,7 @@ import {
   parseDeploymentApproval,
   parsePolicy,
   parseRetentionControl,
+  parseVerifierApproval,
   policyFingerprintMaterial,
 } from "../src/core.js";
 
@@ -149,6 +151,30 @@ function retentionControl(
   };
 }
 
+function verifierApproval(
+  now: number,
+  policyHash: string,
+  overrides: Partial<VerifierApprovalManifest> = {},
+): VerifierApprovalManifest {
+  return {
+    schemaVersion: "1.0",
+    approvalId: "human-gate:p3-system-state-verifier",
+    artifactRevision: GOVERNANCE_ARTIFACT_REVISION,
+    policyHash,
+    deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+    accountId: "0123456789abcdef0123456789abcdef",
+    runtimeWorkerName: "om-cloudflare-os-governance",
+    verifierWorkerName: "om-cloudflare-os-system-state-verifier",
+    routerWorkerName: "om-cloudflare-os",
+    stage: "p3-evaluation",
+    callerId: "system-state-verifier",
+    approvedAt: new Date(now - 1_000).toISOString(),
+    expiresAt: new Date(now + 86_400_000).toISOString(),
+    revoked: false,
+    ...overrides,
+  };
+}
+
 describe("OM Governance Runtime", () => {
   let now: number;
   let sequence: number;
@@ -247,6 +273,50 @@ describe("OM Governance Runtime", () => {
     expect(view.blindSpots).toHaveLength(4);
   });
 
+  it("does not initialize or mutate state through the verifier read capability", async () => {
+    expect(store.values.size).toBe(0);
+    await expect(engine.getVerificationBundle({
+      requestId: "verification-before-initialization",
+      requestedAt: new Date(now).toISOString(),
+    })).rejects.toThrow(/cannot create it/);
+    expect(store.values.size).toBe(0);
+
+    await engine.getOMSystemState();
+    const before = structuredClone([...store.values.entries()]);
+    const bundle = await engine.getVerificationBundle({
+      requestId: "verification-read-only",
+      requestedAt: new Date(now).toISOString(),
+    });
+    expect(bundle).toMatchObject({
+      schemaVersion: "1.0",
+      requestId: "verification-read-only",
+      policyHash: activePolicyHash,
+      deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+      current: { snapshotId: "GSS-0", version: 0 },
+      previous: null,
+      stateView: {
+        subjectType: "system-self",
+        evidence: { verificationStatus: "unverified" },
+      },
+    });
+    expect([...store.values.entries()]).toEqual(before);
+  });
+
+  it("rejects stale or malformed verifier read requests without writing", async () => {
+    await engine.getOMSystemState();
+    const before = structuredClone([...store.values.entries()]);
+    await expect(engine.getVerificationBundle({
+      requestId: "stale-verification",
+      requestedAt: new Date(now - 300_001).toISOString(),
+    })).rejects.toThrow(/freshness window/);
+    await expect(engine.getVerificationBundle({
+      requestId: "unknown-field",
+      requestedAt: new Date(now).toISOString(),
+      authorityRequested: true,
+    } as never)).rejects.toThrow(/unknown or missing fields/);
+    expect([...store.values.entries()]).toEqual(before);
+  });
+
   it("reports a normalized state rate only when the observation basis is sufficient", () => {
     const previous = {
       updatedAt: new Date(now).toISOString(),
@@ -299,6 +369,39 @@ describe("OM Governance Runtime", () => {
       ...manifest,
       schemaVersion: "1.0",
     }), expected, now)).toThrow(/schemaVersion is unsupported/);
+  });
+
+  it("binds verifier approval separately to the Runtime, Verifier, Router, caller, and deployment", () => {
+    const manifest = verifierApproval(now, activePolicyHash);
+    const expected = {
+      approvalId: manifest.approvalId,
+      artifactRevision: GOVERNANCE_ARTIFACT_REVISION,
+      policyHash: activePolicyHash,
+      deploymentBindingFingerprint: ACTIVE_BINDING_FINGERPRINT,
+      accountId: manifest.accountId,
+      runtimeWorkerName: manifest.runtimeWorkerName,
+      verifierWorkerName: manifest.verifierWorkerName,
+      routerWorkerName: manifest.routerWorkerName,
+      stage: manifest.stage,
+      callerId: manifest.callerId,
+    };
+    expect(parseVerifierApproval(JSON.stringify(manifest), expected, now)).toEqual(manifest);
+    expect(() => parseVerifierApproval(JSON.stringify({
+      ...manifest,
+      verifierWorkerName: "other-verifier",
+    }), expected, now)).toThrow(/verifierWorkerName binding mismatch/);
+    expect(() => parseVerifierApproval(JSON.stringify({
+      ...manifest,
+      callerId: "google-sheets-guard",
+    }), expected, now)).toThrow(/callerId binding mismatch/);
+    expect(() => parseVerifierApproval(JSON.stringify({
+      ...manifest,
+      expiresAt: new Date(now - 1).toISOString(),
+    }), expected, now)).toThrow(/validity window/);
+    expect(() => parseVerifierApproval(JSON.stringify({
+      ...manifest,
+      revoked: true,
+    }), expected, now)).toThrow(/revoked/);
   });
 
   it("binds retention control to policy, exact resource, account, Worker, stage, and legal hold", () => {

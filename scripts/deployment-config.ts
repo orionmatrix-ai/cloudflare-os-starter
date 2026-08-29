@@ -59,6 +59,15 @@ export type GovernanceRuntimeConfig = {
   };
 };
 
+export type SystemStateVerifierConfig = {
+  enabled: false;
+} | {
+  enabled: true;
+  approvalReference: string;
+  freshnessSeconds: number;
+  verifierEnablementApproved: true;
+};
+
 /**
  * The public address of the router Worker. Exactly one field is set; `validateConfig` enforces
  * that, since wrangler would otherwise happily deploy both a custom domain and a workers.dev route.
@@ -155,6 +164,8 @@ export interface DeploymentConfig {
     googleSheetsGuard?: { name: string };
     /** Required when the guarded connector is enabled. Private service-binding target only. */
     omGovernanceRuntime?: { name: string };
+    /** Private read-only integrity verifier shown through the existing Workshop. */
+    systemStateVerifier?: { name: string };
     /** Only required when `errorReporting.enabled`. */
     errorReporter?: { name: string };
   };
@@ -167,6 +178,8 @@ export interface DeploymentConfig {
   googleSheetsGuard?: { enabled: boolean };
   /** Evidence-bound state, discrete gate, revalidation, permit, and outcome feedback runtime. */
   governanceRuntime?: GovernanceRuntimeConfig;
+  /** Separate state-integrity verification plane; it cannot mutate Governance Runtime state. */
+  systemStateVerifier?: SystemStateVerifierConfig;
   /** Private explicit-issue destination. */
   errorReporting: { enabled: boolean; environment?: string; release?: string | null };
   /** Workshop KV/R2. `null` requests Wrangler automatic provisioning. */
@@ -233,6 +246,8 @@ export interface GeneratedConfigs {
   googleSheetsGuard?: ProdWranglerConfig;
   /** Absent when `governanceRuntime.enabled` is false or omitted. */
   omGovernanceRuntime?: ProdWranglerConfig;
+  /** Absent when `systemStateVerifier.enabled` is false or omitted. */
+  systemStateVerifier?: ProdWranglerConfig;
   /** Absent when `errorReporting.enabled` is false. */
   errorReporter?: ProdWranglerConfig;
 }
@@ -246,6 +261,7 @@ export interface BaseConfigs {
   customGatekeeper: ProdWranglerConfig;
   googleSheetsGuard: ProdWranglerConfig;
   omGovernanceRuntime: ProdWranglerConfig;
+  systemStateVerifier: ProdWranglerConfig;
   errorReporter: ProdWranglerConfig;
 }
 
