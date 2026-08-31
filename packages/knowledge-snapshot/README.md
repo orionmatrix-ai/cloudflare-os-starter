@@ -182,10 +182,34 @@ node node_modules/wrangler/bin/wrangler.js deploy --dry-run --outdir .wrangler/d
 Windows sandbox permission prevented esbuild/workerd launch; targeted synthetic
 tests and dry-run were rerun with permission adjustment. Dependency installation
 used `--ignore-scripts`. Do not infer a full repository regression or successful
-hosted CI from these commands. No CI workflow is added by this slice.
+hosted CI from these commands. The initial Candidate did not include hosted CI.
 
-No running system was changed, so current rollback is to leave this branch
-unmerged. After a future approved integration, first disable the feature/remove
+### Continuous integration
+
+[Knowledge Snapshot CI](../../.github/workflows/knowledge-snapshot-ci.yml) runs on
+pull requests targeting `main`, pushes to `main`, and manual dispatch. It uses
+an ephemeral Ubuntu runner, exact Node.js/pnpm versions, commit-pinned official
+Actions, the committed submodule revision and a frozen lockfile. Each job has a
+15-minute limit; superseded runs are cancelled. Dependencies are installed
+without lifecycle scripts and no package cache is restored or saved.
+
+The workflow checks its [safety invariants](../../scripts/knowledge-ci.test.ts),
+Knowledge Snapshot types/lint/synthetic tests, existing deployment-generator
+tests and a Worker bundle dry-run. The invariant tests are not a general YAML
+validator or proof that an arbitrary workflow is safe. Hosted run status must
+be verified for the exact commit; local success is not hosted CI evidence.
+
+Permissions are `contents: read`, checkout credentials are not retained, and no
+Cloudflare credential, real Knowledge copy, artifact upload, deployment, source
+export or feature enablement is part of CI. Use separate deployment approval and
+runtime revalidation; a green check never grants execution or Canonical authority.
+
+References: [GitHub workflow permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions)
+and [pinning Actions](https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions).
+
+Before live integration, there is no running Knowledge service to roll back.
+Withdraw a merged change with a reviewed revert PR, without rewriting history.
+After a future approved integration, first disable the feature/remove
 the caller binding, restore the previously verified artifact/configuration and
 verify denied reads. Revocation does not erase copies already read. Deleting
 retained copy data or reverting Canonical content requires its own authority.
