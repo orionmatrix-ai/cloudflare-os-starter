@@ -104,6 +104,25 @@ function enableP3Runtime(config: Record<string, any>): void {
   };
 }
 
+function enableKnowledgeSnapshot(config: Record<string, any>): void {
+  config.aiGateway = { enabled: false };
+  config.workers.knowledgeSnapshot = { name: "acme-knowledge-snapshot" };
+  config.knowledgeSnapshot = {
+    enabled: true,
+    approvalReference: "human-gate:synthetic1-knowledge",
+    artifactRevision: "0123456789abcdef0123456789abcdef01234567",
+    deploymentId: "oao-knowledge-synthetic1",
+    enablementApproved: true,
+  };
+}
+
+async function knowledgeBaseConfigs(): Promise<BaseConfigs> {
+  return {
+    ...await baseConfigs(),
+    knowledgeSnapshot: await baseConfig("../packages/knowledge-snapshot/wrangler.jsonc"),
+  };
+}
+
 // Read from disk rather than inlined, including the Error Reporter's: deploy.ts derives every
 // generated config from these files, so a copy here could drift from what actually ships.
 async function baseConfigs(): Promise<BaseConfigs> {
@@ -964,4 +983,268 @@ test("skips the Error Reporter build when error reporting is disabled", () => {
   });
   const commands = buildCommands(config).map(({ args }) => args.join(" "));
   assert.equal(commands.some((command) => command.includes("error-reporter")), false);
+});
+
+test("Knowledge Snapshot absent and disabled preserve legacy configs and builds exactly", async () => {
+  const bases = await baseConfigs(); // Legacy callers need not load the optional base at all.
+  for (const aiEnabled of [true, false]) {
+    const legacy = variant((c) => { c.aiGateway.enabled = aiEnabled; });
+    const expected = generateConfigs(legacy, bases);
+    for (const enabled of [undefined, false]) {
+      const config = structuredClone(legacy);
+      if (enabled === false) config.knowledgeSnapshot = { enabled: false };
+      // A dormant worker identity does not join active-worker duplicate checking.
+      config.workers.knowledgeSnapshot = { name: config.workers.workshop.name };
+      const generated = generateConfigs(config, bases);
+      assert.deepEqual(generated, expected);
+      assert.equal(JSON.stringify(generated), JSON.stringify(expected));
+      assert.deepEqual(buildCommands(config), buildCommands(legacy));
+      assert.equal(Object.hasOwn(generated, "knowledgeSnapshot"), false);
+      assert.deepEqual(generated.workshop.ai, { binding: "WORKERS_AI" });
+    }
+  }
+});
+
+test("rejects malformed Knowledge Snapshot blocks and disabled unknown fields", () => {
+  for (const knowledge of [
+    null, true, false, [], "enabled", {}, { enabled: "true" }, { enabled: 1 },
+    { enabled: false, approvalReference: "human-gate:unapproved" },
+    { enabled: false, enablementApproved: true },
+    { enabled: false, unknown: false },
+  ]) {
+    assert.throws(() => validateConfig(variant((c) => { c.knowledgeSnapshot = knowledge; })),
+      /knowledgeSnapshot/);
+  }
+});
+
+test("rejects unknown and missing enabled Knowledge Snapshot fields", () => {
+  const unknowns = ["vars", "secrets", "routes", "aiGateway", "callerId", "snapshotJson", "worker"];
+  for (const key of unknowns) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.knowledgeSnapshot[key] = "not-permitted";
+    })), /knowledgeSnapshot.*unknown or missing/);
+  }
+  for (const key of ["approvalReference", "artifactRevision", "deploymentId", "enablementApproved"]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      delete c.knowledgeSnapshot[key];
+    })), /knowledgeSnapshot.*unknown or missing/);
+  }
+});
+
+test("rejects invalid Knowledge approval and deployment IDs without trimming or coercion", () => {
+  for (const key of ["approvalReference", "deploymentId"]) {
+    for (const value of [
+      undefined, null, 1, true, {}, [], "", " ", " leading", "trailing ", "id\n", "id\r\n",
+      "a".repeat(97), "https://approval.example", "../approval", "-prefix", "a.b", "承認",
+    ]) {
+      assert.throws(() => validateConfig(variant((c) => {
+        enableKnowledgeSnapshot(c);
+        c.knowledgeSnapshot[key] = value;
+      })), new RegExp(`knowledgeSnapshot\\.${key}`));
+    }
+  }
+});
+
+test("requires an exact Knowledge artifact revision and explicit true enablement approval", () => {
+  for (const value of [
+    undefined, null, 40, "", "a".repeat(39), "a".repeat(41), "g".repeat(40), "A".repeat(40), "a".repeat(40) + "\n",
+  ]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.knowledgeSnapshot.artifactRevision = value;
+    })), /knowledgeSnapshot\.artifactRevision/);
+  }
+  for (const value of [undefined, null, false, "true", 1]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.knowledgeSnapshot.enablementApproved = value;
+    })), /knowledgeSnapshot\.enablementApproved/);
+  }
+  const boundary = variant((c) => {
+    enableKnowledgeSnapshot(c);
+    c.knowledgeSnapshot.approvalReference = "A";
+    c.knowledgeSnapshot.deploymentId = "a".repeat(96);
+    c.knowledgeSnapshot.artifactRevision = "a".repeat(40);
+  });
+  assert.equal(validateConfig(boundary), boundary);
+});
+
+test("requires Knowledge and existing mandatory Worker identities", () => {
+  for (const key of ["router", "workshop", "context", "scheduler", "customGatekeeper", "knowledgeSnapshot"]) {
+    for (const value of [undefined, null, {}, { name: "" }, { name: 1 }]) {
+      assert.throws(() => validateConfig(variant((c) => {
+        enableKnowledgeSnapshot(c);
+        c.workers[key] = value;
+      })), new RegExp(`workers\\.${key}`));
+    }
+  }
+  for (const value of [
+    [], true, "worker", { name: "bad.name" }, { name: "UPPER" }, { name: "worker\n" },
+    { name: "a".repeat(64) }, { name: "valid-name", routes: [] },
+    { name: "valid-name", props: { callerId: "another-workshop" } },
+  ]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.workers.knowledgeSnapshot = value;
+    })), /workers\.knowledgeSnapshot/);
+  }
+});
+
+test("includes the enabled Knowledge Worker in duplicate identity checks", () => {
+  for (const worker of ["router", "workshop", "context", "scheduler", "customGatekeeper", "errorReporter"]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.workers.knowledgeSnapshot.name = c.workers[worker].name;
+    })), /unique/);
+  }
+  assert.throws(() => validateConfig(variant((c) => {
+    enableP3Runtime(c);
+    enableKnowledgeSnapshot(c);
+    c.workers.knowledgeSnapshot.name = c.workers.omGovernanceRuntime.name;
+  })), /unique/);
+});
+
+test("rejects trailing line breaks in pilot Worker identities", () => {
+  for (const key of ["workshop", "router", "context", "scheduler", "customGatekeeper", "errorReporter"]) {
+    assert.throws(() => validateConfig(variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.workers[key].name += "\n";
+    })), /Worker names/);
+  }
+});
+
+test("rejects Knowledge pilot with an enabled or non-boolean AI Gateway", async () => {
+  const bases = await knowledgeBaseConfigs();
+  for (const enabled of [true, "false", "true", 0, null, undefined]) {
+    const config = variant((c) => {
+      enableKnowledgeSnapshot(c);
+      c.aiGateway.enabled = enabled;
+    });
+    assert.throws(() => validateConfig(config), /knowledgeSnapshot requires aiGateway.enabled=false/);
+    assert.throws(() => generateConfigs(config, bases), /knowledgeSnapshot requires aiGateway.enabled=false/);
+  }
+});
+
+test("requires a Knowledge base only when the pilot is enabled", async () => {
+  const config = variant(enableKnowledgeSnapshot);
+  const bases = await baseConfigs();
+  for (const missing of [undefined, null, false, []]) {
+    assert.throws(() => generateConfigs(config, {
+      ...bases, knowledgeSnapshot: missing,
+    } as unknown as BaseConfigs), /private package base config/);
+  }
+  assert.doesNotThrow(() => generateConfigs(validConfig, bases));
+});
+
+test("generates only a private Knowledge vendor RPC binding with fixed caller props and vars", async () => {
+  const config = variant(enableKnowledgeSnapshot);
+  const bases = await knowledgeBaseConfigs();
+  const originalBases = structuredClone(bases);
+  const originalConfig = structuredClone(config);
+  const generated = generateConfigs(config, bases);
+  const knowledge = generated.knowledgeSnapshot!;
+  assert.ok(knowledge);
+  assert.equal(knowledge.name, config.workers.knowledgeSnapshot!.name);
+  assert.equal(knowledge.account_id, config.accountId);
+  assert.equal(knowledge.main, bases.knowledgeSnapshot!.main);
+  assert.deepEqual(knowledge.build, bases.knowledgeSnapshot!.build);
+  assert.deepEqual(knowledge.migrations, bases.knowledgeSnapshot!.migrations);
+  assert.equal(knowledge.workers_dev, false);
+  assert.equal(knowledge.preview_urls, false);
+  assert.deepEqual(knowledge.routes, []);
+  assert.deepEqual(knowledge.observability, { enabled: false });
+  assert.deepEqual(knowledge.vars, {
+    KNOWLEDGE_ENABLED: "true",
+    KNOWLEDGE_GATEWAY_ENABLED: "true",
+    KNOWLEDGE_DEPLOYMENT_ID: "oao-knowledge-synthetic1",
+    KNOWLEDGE_APPROVAL_ID: "human-gate:synthetic1-knowledge",
+    KNOWLEDGE_ARTIFACT_REVISION: "0123456789abcdef0123456789abcdef01234567",
+    KNOWLEDGE_WORKSHOP_WORKER: config.workers.workshop.name,
+    KNOWLEDGE_WORKER: config.workers.knowledgeSnapshot!.name,
+  });
+  assert.deepEqual(knowledge.secrets, {
+    required: ["KNOWLEDGE_SNAPSHOT_JSON", "KNOWLEDGE_READ_GRANT_JSON", "KNOWLEDGE_PILOT_APPROVAL_JSON"],
+  });
+  assert.deepEqual(generated.workshop.services!.filter(
+    (service) => service.binding === "GATEKEEPER_KNOWLEDGE_SNAPSHOT"), [{
+    binding: "GATEKEEPER_KNOWLEDGE_SNAPSHOT",
+    service: config.workers.knowledgeSnapshot!.name,
+    entrypoint: "GatekeeperVendor",
+    props: { callerId: config.workers.workshop.name },
+  }]);
+  const legacy = structuredClone(config);
+  delete legacy.knowledgeSnapshot;
+  delete legacy.workers.knowledgeSnapshot;
+  const previous = generateConfigs(legacy, bases);
+  assert.deepEqual(generated.router, previous.router); // No Router HTTP route or binding.
+  for (const key of ["context", "scheduler", "customGatekeeper", "errorReporter"] as const) {
+    assert.deepEqual(generated[key], previous[key]);
+  }
+  assert.deepEqual(generated.workshop.ai, previous.workshop.ai);
+  assert.equal(knowledge.ai, undefined);
+  assert.equal(knowledge.services, undefined);
+  assert.equal(knowledge.assets, undefined);
+  assert.equal(aiGatewayPlan(config), null);
+  assert.equal(Object.keys(generated.workshop.vars!).some((key) => key.startsWith("CF_AI_")), false);
+  assert.equal(generated.workshop.secrets?.required.includes("CF_AI_GATEWAY_API_TOKEN") ?? false, false);
+  assert.deepEqual(config, originalConfig);
+  assert.deepEqual(bases, originalBases);
+});
+
+test("Knowledge generation overwrites stale base exposure, AI, vars, secrets, and binding props", async () => {
+  const config = variant((c) => {
+    enableKnowledgeSnapshot(c);
+    c.workers.workshop.name = "different-workshop";
+  });
+  const bases = await knowledgeBaseConfigs();
+  Object.assign(bases.knowledgeSnapshot!, {
+    workers_dev: true, preview_urls: true,
+    routes: [{ pattern: "leak.example.com", custom_domain: true }],
+    observability: { enabled: true, logs: { enabled: true }, traces: { enabled: true } },
+    ai: { binding: "WORKERS_AI" }, services: [{ binding: "AI", service: "outside-worker" }],
+    assets: { directory: "public" }, vars: { KNOWLEDGE_ENABLED: "false", SECRET_COPY: "synthetic" },
+    secrets: { required: ["CF_AI_GATEWAY_API_TOKEN"] },
+  });
+  bases.workshop.services = [{
+    binding: "GATEKEEPER_KNOWLEDGE_SNAPSHOT", service: "wrong-worker",
+    props: { callerId: "untrusted-caller" },
+  }];
+  bases.workshop.secrets = { required: ["CF_AI_GATEWAY_API_TOKEN", "UNRELATED_SECRET"] };
+  const generated = generateConfigs(config, bases);
+  assert.equal(generated.knowledgeSnapshot!.workers_dev, false);
+  assert.equal(generated.knowledgeSnapshot!.preview_urls, false);
+  assert.deepEqual(generated.knowledgeSnapshot!.routes, []);
+  assert.deepEqual(generated.knowledgeSnapshot!.observability, { enabled: false });
+  assert.equal(generated.knowledgeSnapshot!.ai, undefined);
+  assert.equal(generated.knowledgeSnapshot!.services, undefined);
+  assert.equal(generated.knowledgeSnapshot!.assets, undefined);
+  assert.equal(generated.knowledgeSnapshot!.vars!.SECRET_COPY, undefined);
+  assert.equal(generated.knowledgeSnapshot!.secrets!.required.includes("CF_AI_GATEWAY_API_TOKEN"), false);
+  assert.deepEqual(generated.workshop.secrets, { required: ["CF_AI_GATEWAY_API_TOKEN", "UNRELATED_SECRET"] });
+  assert.deepEqual(generated.workshop.ai, { binding: "WORKERS_AI" });
+  assert.deepEqual(generated.workshop.services!.filter(
+    (service) => service.binding === "GATEKEEPER_KNOWLEDGE_SNAPSHOT"), [{
+    binding: "GATEKEEPER_KNOWLEDGE_SNAPSHOT", service: "acme-knowledge-snapshot",
+    entrypoint: "GatekeeperVendor", props: { callerId: "different-workshop" },
+  }]);
+  bases.workshop.secrets = { required: ["CF_AI_GATEWAY_API_TOKEN"] };
+  assert.deepEqual(generateConfigs(config, bases).workshop.secrets, bases.workshop.secrets);
+});
+
+test("builds Knowledge only when enabled through the existing uncached ownBuild path", async () => {
+  const commands = buildCommands(variant(enableKnowledgeSnapshot)).map(({ args }) => args);
+  const knowledge = commands.filter((args) => args.includes("knowledge-snapshot"));
+  assert.deepEqual(knowledge, [["exec", "vp", "run", "-F", "knowledge-snapshot", "--no-cache", "types:check"]]);
+  const pkg = JSON.parse(await readFile(new URL("../packages/knowledge-snapshot/package.json", import.meta.url), "utf8"));
+  assert.equal(typeof pkg.scripts[knowledge[0].at(-1)!], "string");
+  assert.equal(buildCommands(validConfig).some(({ args }) => args.includes("knowledge-snapshot")), false);
+});
+
+test("root CLI loads Knowledge conditionally and deploys it before Workshop, without running CLI", async () => {
+  const source = await readFile(new URL("./deploy.ts", import.meta.url), "utf8");
+  assert.match(source, /knowledgeSnapshot: "packages\/knowledge-snapshot"/);
+  assert.match(source, /config\.knowledgeSnapshot\?\.enabled \? \{\s*knowledgeSnapshot: await readJsonc/);
+  assert.match(source, /if \(config\.knowledgeSnapshot\?\.enabled\) \{\s*deployWorker\(packageDirs\.knowledgeSnapshot, deployArgs\);\s*\}\s*deployWorker\(packageDirs\.workshop, deployArgs\)/);
 });
