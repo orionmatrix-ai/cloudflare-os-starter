@@ -1,0 +1,13 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "knowledge-snapshot-candidate",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "vars": { "KNOWLEDGE_ENABLED": "false" },
+  "limits": { "cpu_ms": 50 },
+  "observability": { "enabled": false }
+}
