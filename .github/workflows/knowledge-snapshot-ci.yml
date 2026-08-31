@@ -1,0 +1,62 @@
+name: Knowledge Snapshot CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledge-snapshot-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  knowledge-snapshot:
+    name: Knowledge Snapshot / synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CI: 'true'
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - name: Checkout reviewed tree and pinned submodule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+          submodules: true
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+
+      - name: Install pinned package manager
+        run: npm install --global pnpm@11.17.0 --ignore-scripts --no-audit --no-fund
+
+      - name: Install frozen dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Validate CI safety contract
+        run: node --test scripts/knowledge-ci.test.ts
+
+      - name: Check Knowledge Snapshot types
+        run: pnpm --filter knowledge-snapshot types:check
+
+      - name: Lint Knowledge Snapshot
+        run: pnpm run lint:check packages/knowledge-snapshot/src packages/knowledge-snapshot/__tests__
+
+      - name: Run synthetic workerd and MCP tests
+        run: pnpm --filter knowledge-snapshot test:run
+
+      - name: Run deployment-generator regression tests
+        run: node --test scripts/deploy.test.ts
+
+      - name: Verify Worker bundle without uploading
+        working-directory: packages/knowledge-snapshot
+        run: node node_modules/wrangler/bin/wrangler.js deploy --dry-run --outdir .wrangler/ci-dry-run
