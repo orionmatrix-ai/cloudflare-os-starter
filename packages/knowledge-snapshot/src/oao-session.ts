@@ -12,6 +12,12 @@ export interface ObservationGate {
 
 /** Bound bytes before SDK parsing. Legacy MCP may return finite SSE even in JSON mode. */
 async function boundedResponse(response: Response, signal: AbortSignal): Promise<Response> {
+  // Reject before acquiring a reader, including responses delivered after abort.
+  // Request cancellation without awaiting potentially stalled provider cleanup.
+  if (signal.aborted || (response.status >= 300 && response.status < 400)) {
+    void response.body?.cancel().catch(() => {});
+    throw new KnowledgeHold();
+  }
   if (response.status === 202 || response.status === 204) {
     void response.body?.cancel().catch(() => {});
     return new Response(null, { status: response.status });
@@ -22,7 +28,7 @@ async function boundedResponse(response: Response, signal: AbortSignal): Promise
     throw new KnowledgeHold();
   }
   const reader = response.body?.getReader();
-  if (!reader || signal.aborted) throw new KnowledgeHold();
+  if (!reader) throw new KnowledgeHold();
   const abort = () => { void reader.cancel().catch(() => {}); };
   signal.addEventListener("abort", abort, { once: true });
   const parts: Uint8Array[] = [];
@@ -92,7 +98,6 @@ export class OaoKnowledgeSession {
             const response = await this.#binding.fetch(new Request(url, {
               ...init, signal: controller.signal, redirect: "manual",
             }));
-            if (response.status >= 300 && response.status < 400) throw new KnowledgeHold();
             return boundedResponse(response, controller.signal);
           },
         });

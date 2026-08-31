@@ -93,6 +93,10 @@ Formatting changes to snapshot JSON change its digest and require reapproval.
   The server deadline includes complete response buffering, propagates caller
   cancellation and cannot outlive the read grant. Redirect following is disabled
   on the request before it reaches the binding, with 3xx responses also rejected.
+  Rejected redirect bodies and responses arriving after abort are cancelled before
+  acquiring a reader. Cleanup rejection is suppressed and cleanup is not awaited,
+  so stalled underlying cancellation cannot delay HOLD. Cancellation is requested,
+  not a guarantee that a remote provider has finished releasing its resources.
 - Session timeout 10 seconds, default 1 read attempt, constructor maximum 5.
   Attempts are reserved before awaiting, including failures and concurrent calls.
   No application-level retry, fallback or authority expansion.
@@ -150,13 +154,24 @@ wrong IDs and forged identity, request/response bounds, unsupported writes,
 real MCP SDK handshake/discovery/read, denied observation, revocation after Gate,
 parallel attempt reservation and redirects. These are not live service evidence.
 
-Local verification at base `9f0d3b7` plus this uncommitted Candidate:
+Initial local verification, recorded in Candidate commit `4297282` (base `9f0d3b7`):
 63 synthetic tests passed, 35 existing deployment-generator tests passed,
 TypeScript check and scoped lint passed. Independent HARUSPEX review identified
 two P2 issues (SDK subscription stream and redirect policy); both received local
 fixes and negative tests. Independent re-review reproduced their closure and
 recommended adoption as a local Candidate, with no remaining P1/P2 in that
 review scope. It did not rerun the entire suite or approve live deployment.
+
+PR #4's later independent review found a separate P2 cleanup defect: a late
+response after timeout retained its reader lock, and a rejected 302 response
+did not cancel its body. The follow-up fix rejects both before reader acquisition
+and requests body cancellation without waiting for cleanup. Six new negative
+tests cover immediate, rejected and pending cancellation for both paths; all six
+failed on the prior implementation and passed after this fix. The updated suite
+passed 69 synthetic tests, alongside 35 existing deployment-generator tests,
+TypeScript and scoped lint. These checks are local evidence, not hosted CI or
+live Cloudflare behavior. Independent re-review and the human merge decision
+remain separate from this implementation record.
 
 Worker bundle check, from this package directory (no upload):
 

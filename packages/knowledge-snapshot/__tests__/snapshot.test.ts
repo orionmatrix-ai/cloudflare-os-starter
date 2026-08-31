@@ -229,6 +229,63 @@ describe("OAO observation adapter", () => {
       expect(cancelled).toBe(true);
     } finally { vi.useRealTimers(); }
   });
+  for (const cleanup of ["immediate", "rejected", "pending"]) {
+    const cancelBody = () => vi.fn(() => {
+      if (cleanup === "rejected") return Promise.reject(new Error("synthetic cancellation failure"));
+      if (cleanup === "pending") return new Promise<void>(() => {});
+    });
+    it(`releases a late response after timeout (${cleanup} cancellation)`, async () => {
+      const { request, grant } = await fixture();
+      const cancel = cancelBody();
+      const response = new Response(new ReadableStream({ cancel }), {
+        headers: { "content-type": "application/json" },
+      });
+      let release!: (response: Response) => void;
+      let incomingSignal: AbortSignal | undefined;
+      const fetch = vi.fn(async (incoming: Request) => {
+        incomingSignal = incoming.signal;
+        return new Promise<Response>(resolve => { release = resolve; });
+      });
+      vi.useFakeTimers();
+      try {
+        const session = new OaoKnowledgeSession({ fetch },
+          { authorizeObservation: async () => {} }, request, grant.workPackageId);
+        const rejected = expect(session.read()).rejects.toThrow(/^KNOWLEDGE_HOLD$/);
+        await vi.advanceTimersByTimeAsync(LIMITS.timeoutMs + 1);
+        await rejected;
+        expect(incomingSignal?.aborted).toBe(true);
+        release(response);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(response.body?.locked).toBe(false);
+        await expect(session.read()).rejects.toThrow(/^KNOWLEDGE_HOLD$/);
+        expect(fetch).toHaveBeenCalledTimes(1);
+      } finally { vi.useRealTimers(); }
+    });
+    it(`releases a rejected redirect body (${cleanup} cancellation)`, async () => {
+      const { request, grant } = await fixture();
+      const cancel = cancelBody();
+      const response = new Response(new ReadableStream({ cancel }), {
+        status: 302, headers: { location: "https://example.com", "content-type": "application/json" },
+      });
+      const fetch = vi.fn(async (incoming: Request) => {
+        expect(incoming.redirect).toBe("manual");
+        return response;
+      });
+      vi.useFakeTimers();
+      try {
+        const session = new OaoKnowledgeSession({ fetch },
+          { authorizeObservation: async () => {} }, request, grant.workPackageId);
+        const rejected = expect(session.read()).rejects.toThrow(/^KNOWLEDGE_HOLD$/);
+        await vi.advanceTimersByTimeAsync(0);
+        await rejected;
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(response.body?.locked).toBe(false);
+        await expect(session.read()).rejects.toThrow(/^KNOWLEDGE_HOLD$/);
+        expect(fetch).toHaveBeenCalledTimes(1);
+      } finally { vi.useRealTimers(); }
+    });
+  }
   it("authorizes before transport and returns validated citations; one-use session by default", async () => {
     const { env, request, grant } = await fixture(); const events: string[] = [];
     const session = new OaoKnowledgeSession({ fetch: async incoming => {
