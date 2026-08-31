@@ -1,6 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { KnowledgeEnv } from "./contracts.js";
 import { handleKnowledgeMcp } from "./mcp.js";
+export { GatekeeperVendor, KnowledgePilotAccount } from "./gateway.js";
+export { KnowledgePilotLedger } from "./pilot-ledger.js";
 
 /** Only an administrator-created service binding may supply the caller capability. */
 export class KnowledgeSnapshotMcp extends WorkerEntrypoint<KnowledgeEnv, { callerId?: string }> {

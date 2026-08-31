@@ -1,4 +1,113 @@
-# OAO Knowledge Snapshot — v0.1 Candidate
+# OAO Knowledge Snapshot — synthetic pilot Candidate
+
+## v0.2 implementation status and operating boundary
+
+The current change adds an **Implemented / locally Tested Candidate** for an
+administrator-operated synthetic read in the existing OAO Workshop. It is not
+live connection, successful hosted CI, Production operation or automatic
+Canonical promotion evidence. The v0.1 record below is historical; the following
+section describes the additional implementation and its remaining limitations.
+
+The human authorized an initial experiment using one synthetic document only,
+with no real Vault text, synchronization or AI calls. The permitted body is the
+literal `SYNTHETIC_CONTENT` in [pilot.ts](./src/pilot.ts); relabeling another body
+as synthetic, even with recomputed hashes, is rejected. No filesystem/export
+path is present. Other Workshop capabilities are preserved, not disabled globally.
+
+### Trust and data path
+
+```text
+Authenticated Workshop management API (account ownership + server isAdmin)
+  -> GatekeeperVendor private service binding (fixed Workshop caller props)
+  -> own Account -> 60-second admin management UI capability
+  -> manual read with displayed approval hash
+  -> administrator-provisioned exact approval + durable single reservation
+  -> OaoKnowledgeSession revalidation -> private MCP loopback binding
+  -> transient browser result + bounded body-free durable receipt
+```
+
+This uses the existing Gatekeeper management UI, **not** an AI agent singleton,
+general work-package dispatcher or automatic Knowledge search. The synthetic
+work-package ID is fixed in server-provisioned approval; this does not implement
+generic OAO task ownership. `ApprovalQueue.authorizeObservation` is not used as
+evidence of human approval: upstream it records sharing/observation, not that Gate.
+
+Workshop checks account ownership and computes `isAdmin`; the iframe cannot set
+them. Captured admin authority lasts at most 60 seconds, and reopening requires
+another Workshop check. Account revocation and manifest/time/hash are rechecked
+before every MCP transport request and result release. Role removal is **not** instant revocation
+of an already issued 60-second capability. Environment updates likewise do not
+guarantee immediate termination on older in-flight Worker versions.
+
+[pilot-ledger.ts](./src/pilot-ledger.ts) permits **one attempt per deployed Worker
+namespace**, across accounts, sessions and concurrent calls. Failure consumes it.
+Replacing the grant or reopening the page does not reset it. There is no reset,
+list, deletion, purge or automatic retry API. One attempt record contains opaque
+IDs, hashes, timestamps and status; per-account objects may retain one revocation
+boolean. No document body is persisted by this ledger. A crash may leave
+`RESERVED`: hold for investigation, never infer permission to retry. `OBSERVED_COPY`
+means MCP observation succeeded, not proof of UI delivery or live source accuracy.
+This receipt is not yet integrated with OM Execution Event, Judgement Log or
+System State. Retained records have no automatic deletion in this experiment.
+
+### Deployment contract
+
+The root generator accepts optional `knowledgeSnapshot.enabled=true` only with
+`enablementApproved=true`, an opaque approval reference/deployment ID, a lowercase
+40-character artifact revision and a unique private Worker name. It requires
+`aiGateway.enabled=false` for this pilot; adding Knowledge does not remove the
+Workshop's existing Workers AI binding or unrelated secret requirements. Existing
+configurations without Knowledge are unchanged. Repository defaults are disabled.
+
+The generated Worker has no public URL/routes, telemetry, AI binding or external
+service binding. Workshop receives only `GATEKEEPER_KNOWLEDGE_SNAPSHOT`, targeting
+`GatekeeperVendor` with its own name in trusted `callerId` props. Router is unchanged.
+The same private Worker exports a named MCP entrypoint; the gateway uses a
+Cloudflare loopback service binding. Test-only ledger configuration is not exported
+by the production entrypoint. Browser RPC is bundled locally, with no CDN request.
+
+In addition to the v0.1 snapshot and read grant, provision
+`KNOWLEDGE_PILOT_APPROVAL_JSON` against [pilotApprovalSchema](./src/pilot.ts).
+It binds approval ID, artifact, exact Worker names, deployment, task, document,
+snapshot hash, expiry and maximumReads=1. This is trusted administrator-provisioned
+configuration, **not a signature or cryptographic proof of human approval**.
+Provisioning must reference the actual human authorization and verified artifact.
+No secret values belong in Git, chat, screenshots or diagnostic output.
+
+For the first live evaluation, verify exact CI/artifact and current Workshop
+configuration, record the rollback version, deploy the new private Worker before
+adding its Workshop binding, then set this vendor to **Optional**, not globally
+auto-provisioned Enabled. The owner adds their account and opens its management
+app. Verify the displayed scope before the single read. No source export, Google
+read, AI call, retention deletion or other service enablement is included.
+Do not use the root all-Workers deploy command for this two-Worker scoped change.
+
+### Verification and recovery
+
+[pilot.test.ts](./__tests__/pilot.test.ts) tests strict synthetic approval, real MCP
+client/server transport, admin/revocation/time boundaries, durable SQLite quota,
+parallel calls, failure terminality and receipt privacy. Local transport includes
+binding stand-ins; successful live Workshop UI and cross-Worker provisioning must
+be verified separately. The deployment tests verify legacy compatibility and exact
+private binding generation. CI regenerates browser RPC before types/tests/bundling.
+
+Local verification of this slice: 98 package tests, 49 deployment tests and 3 CI
+invariant tests passed, along with package/script types, scoped lint and Worker
+bundle dry-run. Independent read-only HARUSPEX review reproduced an initial P2:
+account revocation after MCP initialize did not prevent a later tools/call. The
+per-request binding revalidation fix closed it (independent reproduction changed
+tools/call from 1 to 0). Re-review found no remaining P1/P2 in its scoped code
+review and recommended adoption for the limited synthetic pilot. These statements
+do not assert hosted CI success, live connectivity or recovery verification.
+
+If setup or read fails, keep the pilot disabled/held, inspect body-free evidence
+and do not automatically reset its one-attempt quota. Recovery starts by disabling
+the vendor, removing the added Workshop binding or restoring the recorded Workshop
+version, and disabling Knowledge flags. Preserve the ledger; no destructive rollback
+is authorized by this runbook. Verify denied reads after rollback. Restoring code
+does not undo already displayed copies or reset durable state.
+
+## Historical v0.1 Candidate record
 
 ## Decision and status
 

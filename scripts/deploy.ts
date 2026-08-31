@@ -31,6 +31,7 @@ const packageDirs = {
   googleSheetsGuard: "packages/google-sheets-guard",
   omGovernanceRuntime: "packages/om-governance-runtime",
   systemStateVerifier: "packages/system-state-verifier",
+  knowledgeSnapshot: "packages/knowledge-snapshot",
   errorReporter: "packages/error-reporter",
 } as const;
 const generatedPaths = Object.fromEntries(
@@ -38,6 +39,8 @@ const generatedPaths = Object.fromEntries(
 ) as Record<keyof typeof packageDirs, string>;
 const defaultContextArtifactsNamespace = "gatekeeper-context-collections";
 const accountIdPattern = /^[a-f\d]{32}$/i;
+// Match the Knowledge grant's opaque IDs, never a path, URL, or secret payload.
+const knowledgeIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/;
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -97,6 +100,10 @@ const governanceRuntimePaths = [
 
 const systemStateVerifierPaths = [
   "workers.systemStateVerifier.name",
+];
+
+const knowledgeSnapshotPaths = [
+  "workers.knowledgeSnapshot.name",
 ];
 
 const resourcePaths = [
@@ -192,7 +199,50 @@ function validatePublicBaseUrl(config: DeploymentConfig, route: RouterRoute): vo
   }
 }
 
+function validateKnowledgeSnapshot(config: DeploymentConfig): void {
+  const knowledge = config.knowledgeSnapshot;
+  if (knowledge !== undefined) {
+    if (knowledge === null || typeof knowledge !== "object" || Array.isArray(knowledge) ||
+        typeof knowledge.enabled !== "boolean") {
+      throw new Error("knowledgeSnapshot must be an object with boolean enabled.");
+    }
+    const keys = knowledge.enabled
+      ? ["enabled", "approvalReference", "artifactRevision", "deploymentId", "enablementApproved"]
+      : ["enabled"];
+    if (JSON.stringify(Object.keys(knowledge).toSorted()) !== JSON.stringify(keys.toSorted())) {
+      throw new Error("knowledgeSnapshot has unknown or missing fields.");
+    }
+    if (knowledge.enabled) {
+      for (const key of ["approvalReference", "deploymentId"] as const) {
+        const value = knowledge[key];
+        if (typeof value !== "string" || value.trim() !== value || !knowledgeIdPattern.test(value)) {
+          throw new Error(`knowledgeSnapshot.${key} must be a bounded opaque ID (1..96 characters).`);
+        }
+      }
+      if (typeof knowledge.artifactRevision !== "string" ||
+          knowledge.artifactRevision.length !== 40 || !/^[a-f\d]{40}$/.test(knowledge.artifactRevision)) {
+        throw new Error("knowledgeSnapshot.artifactRevision must be exactly 40 hexadecimal characters.");
+      }
+      if (knowledge.enablementApproved !== true) {
+        throw new Error("knowledgeSnapshot.enablementApproved must be true before deployment.");
+      }
+      if (config.aiGateway?.enabled !== false) {
+        throw new Error("knowledgeSnapshot requires aiGateway.enabled=false; this pilot permits no AI calls.");
+      }
+    }
+  }
+  const worker = config.workers?.knowledgeSnapshot;
+  if (worker !== undefined && (worker === null || typeof worker !== "object" ||
+      Array.isArray(worker) || Object.keys(worker).length !== 1 ||
+      !Object.hasOwn(worker, "name") || typeof worker.name !== "string" ||
+      worker.name.trim() !== worker.name ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(worker.name))) {
+    throw new Error("workers.knowledgeSnapshot must contain only a valid Worker name.");
+  }
+}
+
 export function validateConfig(config: DeploymentConfig): DeploymentConfig {
+  validateKnowledgeSnapshot(config);
   const googleSheetsGuard = config.googleSheetsGuard;
   if (googleSheetsGuard !== undefined &&
       (googleSheetsGuard === null || typeof googleSheetsGuard !== "object" ||
@@ -328,6 +378,7 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
     ...(config.googleSheetsGuard?.enabled ? googleSheetsGuardPaths : []),
     ...(config.governanceRuntime?.enabled ? governanceRuntimePaths : []),
     ...(config.systemStateVerifier?.enabled ? systemStateVerifierPaths : []),
+    ...(config.knowledgeSnapshot?.enabled ? knowledgeSnapshotPaths : []),
   ];
   for (const path of activePaths) {
     const value = valueAt(config, path);
@@ -381,13 +432,16 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
       (key !== "errorReporter" || config.errorReporting.enabled) &&
       (key !== "googleSheetsGuard" || config.googleSheetsGuard?.enabled) &&
       (key !== "omGovernanceRuntime" || config.governanceRuntime?.enabled) &&
-      (key !== "systemStateVerifier" || config.systemStateVerifier?.enabled))
+      (key !== "systemStateVerifier" || config.systemStateVerifier?.enabled) &&
+      (key !== "knowledgeSnapshot" || config.knowledgeSnapshot?.enabled))
     .map(([, worker]) => worker!.name);
   if (new Set(workerNames).size !== workerNames.length) {
     throw new Error(
       "All enabled Worker names must be unique.");
   }
-  if (!workerNames.every((name) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name))) {
+  if (!workerNames.every((name) =>
+    (!config.knowledgeSnapshot?.enabled || typeof name === "string" && name.trim() === name) &&
+    /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name))) {
     throw new Error("Worker names must use lowercase letters, numbers, and hyphens.");
   }
 
@@ -604,6 +658,13 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   const activeSystemStateVerifier = config.systemStateVerifier?.enabled
     ? config.systemStateVerifier
     : undefined;
+  const activeKnowledgeSnapshot = config.knowledgeSnapshot?.enabled
+    ? config.knowledgeSnapshot
+    : undefined;
+  if (activeKnowledgeSnapshot && (!bases.knowledgeSnapshot ||
+      typeof bases.knowledgeSnapshot !== "object" || Array.isArray(bases.knowledgeSnapshot))) {
+    throw new Error("enabled knowledgeSnapshot requires its private package base config.");
+  }
   const activeGovernancePolicy = activeGovernanceRuntime
     ? (() => {
         const policyInput = {
@@ -627,6 +688,9 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     : undefined;
   const systemStateVerifier = config.systemStateVerifier?.enabled
     ? structuredClone(bases.systemStateVerifier)
+    : undefined;
+  const knowledgeSnapshot = activeKnowledgeSnapshot
+    ? structuredClone(bases.knowledgeSnapshot!)
     : undefined;
   const errorReporter = config.errorReporting.enabled
     ? structuredClone(bases.errorReporter)
@@ -681,8 +745,8 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
       };
     }
   }
-  // Unconditional: as well as being the AI Gateway transport, this binding is what webFetch's
-  // toMarkdown() runs on.
+  // Preserve existing webFetch/toMarkdown support. The Knowledge pilot never calls AI;
+  // adding it does not remove capabilities or secret requirements from the Workshop.
   workshop.ai = { binding: "WORKERS_AI" };
   workshop.services = [
     ...(config.errorReporting.enabled ? [{
@@ -723,6 +787,12 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
       binding: "GATEKEEPER_SYSTEM_STATE_VERIFIER",
       service: config.workers.systemStateVerifier!.name,
       entrypoint: "GatekeeperVendor",
+    }] : []),
+    ...(knowledgeSnapshot ? [{
+      binding: "GATEKEEPER_KNOWLEDGE_SNAPSHOT",
+      service: config.workers.knowledgeSnapshot!.name,
+      entrypoint: "GatekeeperVendor",
+      props: { callerId: config.workers.workshop.name },
     }] : []),
   ];
   workshop.kv_namespaces = [
@@ -853,6 +923,30 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     systemStateVerifier.secrets = { required: ["OM_GOVERNANCE_VERIFIER_APPROVAL"] };
   }
 
+  if (knowledgeSnapshot && activeKnowledgeSnapshot) {
+    setCommon(knowledgeSnapshot, config, config.workers.knowledgeSnapshot!.name);
+    // Never inherit global telemetry, public routes, AI, or outbound service bindings.
+    knowledgeSnapshot.workers_dev = false;
+    knowledgeSnapshot.preview_urls = false;
+    knowledgeSnapshot.routes = [];
+    knowledgeSnapshot.observability = { enabled: false };
+    delete knowledgeSnapshot.ai;
+    delete knowledgeSnapshot.services;
+    delete knowledgeSnapshot.assets;
+    knowledgeSnapshot.vars = {
+      KNOWLEDGE_ENABLED: "true",
+      KNOWLEDGE_GATEWAY_ENABLED: "true",
+      KNOWLEDGE_DEPLOYMENT_ID: activeKnowledgeSnapshot.deploymentId,
+      KNOWLEDGE_APPROVAL_ID: activeKnowledgeSnapshot.approvalReference,
+      KNOWLEDGE_ARTIFACT_REVISION: activeKnowledgeSnapshot.artifactRevision,
+      KNOWLEDGE_WORKSHOP_WORKER: config.workers.workshop.name,
+      KNOWLEDGE_WORKER: config.workers.knowledgeSnapshot!.name,
+    };
+    knowledgeSnapshot.secrets = {
+      required: ["KNOWLEDGE_SNAPSHOT_JSON", "KNOWLEDGE_READ_GRANT_JSON", "KNOWLEDGE_PILOT_APPROVAL_JSON"],
+    };
+  }
+
   if (errorReporter) {
     setCommon(errorReporter, config, config.workers.errorReporter!.name);
   }
@@ -862,6 +956,7 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     ...(googleSheetsGuard && { googleSheetsGuard }),
     ...(omGovernanceRuntime && { omGovernanceRuntime }),
     ...(systemStateVerifier && { systemStateVerifier }),
+    ...(knowledgeSnapshot && { knowledgeSnapshot }),
     ...(errorReporter && { errorReporter }),
   };
 }
@@ -912,6 +1007,10 @@ export function buildCommands(config: DeploymentConfig): BuildCommand[] {
     ...(config.governanceRuntime?.enabled ? [{ args: ownBuild("om-governance-runtime") }] : []),
     ...(config.systemStateVerifier?.enabled
       ? [{ args: ownBuild("system-state-verifier") }]
+      : []),
+    // This package exposes types:check; Wrangler's own build prepares the vendor RPC bundle.
+    ...(config.knowledgeSnapshot?.enabled
+      ? [{ args: ownBuild("knowledge-snapshot", "types:check") }]
       : []),
     ...(config.googleSheetsGuard?.enabled ? [
       // The wrapper inherits the pinned Google worker. Its imported module references generated
@@ -1039,6 +1138,10 @@ async function main(): Promise<void> {
     omGovernanceRuntime: await readJsonc(join(root, packageDirs.omGovernanceRuntime, "wrangler.jsonc")),
     systemStateVerifier: await readJsonc(
       join(root, packageDirs.systemStateVerifier, "wrangler.jsonc")),
+    ...(config.knowledgeSnapshot?.enabled ? {
+      knowledgeSnapshot: await readJsonc<ProdWranglerConfig>(
+        join(root, packageDirs.knowledgeSnapshot, "wrangler.jsonc")),
+    } : {}),
     errorReporter: await readJsonc(join(root, packageDirs.errorReporter, "wrangler.jsonc")),
   });
   reportAiGateway(config);
@@ -1068,11 +1171,17 @@ async function main(): Promise<void> {
     if (config.googleSheetsGuard?.enabled) {
       deployWorker(packageDirs.googleSheetsGuard, deployArgs);
     }
+    if (config.knowledgeSnapshot?.enabled) {
+      deployWorker(packageDirs.knowledgeSnapshot, deployArgs);
+    }
     deployWorker(packageDirs.workshop, deployArgs);
     // Last: it binds every one of the above.
     deployWorker(packageDirs.router, deployArgs);
   } finally {
-    await Promise.all(Object.values(generatedPaths).map((path) => rm(path, { force: true })));
+    // Only remove Knowledge output when this run generated it; disabled stays a legacy no-op.
+    await Promise.all(Object.entries(generatedPaths)
+      .filter(([name]) => name !== "knowledgeSnapshot" || config.knowledgeSnapshot?.enabled)
+      .map(([, path]) => rm(path, { force: true })));
   }
 }
 

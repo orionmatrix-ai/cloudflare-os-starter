@@ -68,6 +68,17 @@ export type SystemStateVerifierConfig = {
   verifierEnablementApproved: true;
 };
 
+/** Explicit, separately approved synthetic Knowledge pilot; absent means disabled. */
+export type KnowledgeSnapshotConfig = {
+  enabled: false;
+} | {
+  enabled: true;
+  approvalReference: string;
+  artifactRevision: string;
+  deploymentId: string;
+  enablementApproved: true;
+};
+
 /**
  * The public address of the router Worker. Exactly one field is set; `validateConfig` enforces
  * that, since wrangler would otherwise happily deploy both a custom domain and a workers.dev route.
@@ -166,6 +177,8 @@ export interface DeploymentConfig {
     omGovernanceRuntime?: { name: string };
     /** Private read-only integrity verifier shown through the existing Workshop. */
     systemStateVerifier?: { name: string };
+    /** Private Workshop vendor-RPC target, required only for the Knowledge pilot. */
+    knowledgeSnapshot?: { name: string };
     /** Only required when `errorReporting.enabled`. */
     errorReporter?: { name: string };
   };
@@ -180,6 +193,8 @@ export interface DeploymentConfig {
   governanceRuntime?: GovernanceRuntimeConfig;
   /** Separate state-integrity verification plane; it cannot mutate Governance Runtime state. */
   systemStateVerifier?: SystemStateVerifierConfig;
+  /** Configuration-held synthetic snapshot; no AI Gateway calls in this pilot. */
+  knowledgeSnapshot?: KnowledgeSnapshotConfig;
   /** Private explicit-issue destination. */
   errorReporting: { enabled: boolean; environment?: string; release?: string | null };
   /** Workshop KV/R2. `null` requests Wrangler automatic provisioning. */
@@ -248,6 +263,8 @@ export interface GeneratedConfigs {
   omGovernanceRuntime?: ProdWranglerConfig;
   /** Absent when `systemStateVerifier.enabled` is false or omitted. */
   systemStateVerifier?: ProdWranglerConfig;
+  /** Absent when `knowledgeSnapshot.enabled` is false or omitted. */
+  knowledgeSnapshot?: ProdWranglerConfig;
   /** Absent when `errorReporting.enabled` is false. */
   errorReporter?: ProdWranglerConfig;
 }
@@ -262,6 +279,8 @@ export interface BaseConfigs {
   googleSheetsGuard: ProdWranglerConfig;
   omGovernanceRuntime: ProdWranglerConfig;
   systemStateVerifier: ProdWranglerConfig;
+  /** Optional for legacy callers; mandatory when the Knowledge pilot is enabled. */
+  knowledgeSnapshot?: ProdWranglerConfig;
   errorReporter: ProdWranglerConfig;
 }
 
