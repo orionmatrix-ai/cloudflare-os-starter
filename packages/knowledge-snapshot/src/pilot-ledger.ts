@@ -16,6 +16,9 @@ export class KnowledgePilotLedger extends DurableObject<PilotEnv> {
   async isAccountActive(): Promise<boolean> {
     return !await this.ctx.storage.get("revoked");
   }
+  async hasAttempt(): Promise<boolean> {
+    return Boolean(await this.ctx.storage.get("attempt"));
+  }
   async reserve(owner: string, approvalHash: string): Promise<boolean> {
     try {
     const scope = await loadPilotScope(this.env);

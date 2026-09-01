@@ -17,7 +17,7 @@ window.parent.postMessage({type:'handshake'},'*',[port2]);
 const host=newMessagePortRpcSession(port1);
 const out=document.getElementById('out'), read=document.getElementById('read');
 let expected;
-try {expected=await host.ui.describeRead();out.textContent=JSON.stringify(expected,null,2);read.disabled=false;}
+try {expected=await host.ui.describeRead();out.textContent=JSON.stringify(expected,null,2);read.disabled=!expected.attemptAvailable;}
 catch {out.textContent='HOLD: 認可・設定を確認し、画面を開き直してください。';}
 read.onclick=async()=>{read.disabled=true;try{out.textContent=JSON.stringify(await host.ui.readSynthetic(expected.approvalHash),null,2);}catch{out.textContent='HOLD: 読取は完了確認できません。自動再試行しません。結果記録を確認してください。';}};
 document.getElementById('receipt').onclick=async()=>{try{out.textContent=JSON.stringify(await host.ui.getReceipt(),null,2);}catch{out.textContent='HOLD: 管理者画面を開き直してください。';}};

@@ -10,7 +10,7 @@ import type { KnowledgePilotLedger, PilotReceipt } from "./pilot-ledger.js";
 import { PILOT_HTML } from "./pilot-ui.js";
 
 const ICON = { url: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext x='3' y='26'%3EK%3C/text%3E%3C/svg%3E" };
-type Ledger = Pick<KnowledgePilotLedger, "reserve" | "finish" | "receipt">;
+type Ledger = Pick<KnowledgePilotLedger, "hasAttempt" | "reserve" | "finish" | "receipt">;
 type AccountState = Pick<KnowledgePilotLedger, "isAccountActive" | "revokeAccount">;
 export type PilotReadOutput = { result: ReadResult; receipt: PilotReceipt };
 
@@ -27,11 +27,13 @@ export class KnowledgePilotUi extends RpcTarget {
     if (!await this.account.isAccountActive()) throw new KnowledgeHold();
     requireUiAuthority(this.isAdmin, this.#openedAt);
   }
-  async describeRead(): Promise<{ approvalHash: string; documentId: string; workPackageId: string; expiresAt: string }> {
+  async describeRead(): Promise<{ approvalHash: string; documentId: string; workPackageId: string;
+    expiresAt: string; attemptAvailable: boolean }> {
     await this.#authorize();
     const scope = await loadPilotScope(this.env);
     return { approvalHash: scope.approvalHash, documentId: scope.request.documentId,
-      workPackageId: scope.request.workPackageId, expiresAt: scope.expiresAt };
+      workPackageId: scope.request.workPackageId, expiresAt: scope.expiresAt,
+      attemptAvailable: !await this.ledger.hasAttempt() };
   }
   async readSynthetic(expectedApprovalHash: string): Promise<PilotReadOutput> {
     await this.#authorize();
