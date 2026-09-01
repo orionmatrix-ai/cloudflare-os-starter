@@ -90,6 +90,7 @@ describe("synthetic pilot authorization", () => {
     expect(await account.describe()).not.toHaveProperty("singleton");
     await expect(account.startAppUi({ isAdmin: false })).rejects.toThrow();
     expect(PILOT_HTML).toContain("textContent");
+    expect(PILOT_HTML).toContain("read.disabled=!expected.attemptAvailable");
     expect(PILOT_HTML).not.toMatch(/innerHTML|https:\/\/cdn|fetch\(/);
   });
 });
@@ -124,12 +125,14 @@ describe("durable bounded pilot", () => {
     const fetch = vi.fn((request: Request) => handleKnowledgeMcp(request, config, PILOT_CALLER));
     const ui = new KnowledgePilotUi(config, owner, true, ledger, active, { fetch });
     const description = await ui.describeRead();
+    expect(description.attemptAvailable).toBe(true);
     const result = await ui.readSynthetic(description.approvalHash);
     expect(result.result.document.content).toBe(SYNTHETIC_CONTENT);
     expect(result.receipt.status).toBe("OBSERVED_COPY");
     expect(await ui.getReceipt()).toEqual(result.receipt);
     const count = fetch.mock.calls.length;
     const second = new KnowledgePilotUi(config, owner, true, ledger, active, { fetch });
+    expect((await second.describeRead()).attemptAvailable).toBe(false);
     await expect(second.readSynthetic(description.approvalHash)).rejects.toThrow();
     expect(fetch).toHaveBeenCalledTimes(count);
   });
@@ -146,6 +149,7 @@ describe("durable bounded pilot", () => {
     const { config, ledger } = await fixture(); const owner = crypto.randomUUID();
     let activeAccount = true;
     const recordingLedger = {
+      hasAttempt: () => ledger.hasAttempt(),
       reserve: (id: string, hash: string) => ledger.reserve(id, hash),
       receipt: (id: string) => ledger.receipt(id),
       finish: async (id: string, hash: string, success: boolean) => {
